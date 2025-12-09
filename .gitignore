@@ -1,0 +1,10 @@
+.env
+venv/
+__pycache__/
+downloads/
+image_not_scan/
+images/
+models/
+pipeline_output/
+start_server.sh
+app/pipeline_reference.py
