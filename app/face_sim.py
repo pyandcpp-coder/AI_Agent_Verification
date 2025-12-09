@@ -35,3 +35,4 @@ class FaceAgent:
         score = similarity * 100
         
         return float(max(0, min(100, score)))
+    

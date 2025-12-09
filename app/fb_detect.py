@@ -6,7 +6,7 @@ class DocAgent:
         # Load model once when server starts
         print(f"Loading Document Model from {model_path}...")
         self.model = YOLO(model_path)
-        self.conf_threshold = 0.65
+        self.conf_threshold = 0.40
 
     def _detect(self, img):
         """Helper to run detection on a single loaded image"""
@@ -49,10 +49,28 @@ class DocAgent:
         label_f, conf_f, box_f = self._detect(img_f)
         label_b, conf_b, box_b = self._detect(img_b)
 
+        # Log detections
+        print(f"\n=== Document Detection Results ===")
+        print(f"Front Image: {front_path}")
+        print(f"  - Detected: {label_f if label_f else 'None'}")
+        print(f"  - Confidence: {conf_f:.4f}")
+        if box_f is not None:
+            print(f"  - Bounding Box: {box_f.tolist()}")
+        
+        print(f"\nBack Image: {back_path}")
+        print(f"  - Detected: {label_b if label_b else 'None'}")
+        print(f"  - Confidence: {conf_b:.4f}")
+        if box_b is not None:
+            print(f"  - Bounding Box: {box_b.tolist()}")
+        print("=" * 35 + "\n")
+
         # 3. Validate Presence (Fail Fast)
-        # Note: Ensure your YOLO labels are 'front' and 'back' (lowercase)
-        front_detected = label_f and "front" in label_f.lower()
-        back_detected = label_b and "back" in label_b.lower()
+        # Check for all possible front/back label variations
+        front_labels = ["aadhar_front", "aadhar_long_front"]
+        back_labels = ["aadhar_back", "aadhar_long_back"]
+        
+        front_detected = label_f and any(fl in label_f.lower() for fl in front_labels)
+        back_detected = label_b and any(bl in label_b.lower() for bl in back_labels)
 
         if not front_detected:
             return {
