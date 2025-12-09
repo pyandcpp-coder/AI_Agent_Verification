@@ -1,134 +1,185 @@
+import os
+import shutil
+import uuid
 import asyncio
-import cv2
-import numpy as np
-import requests
-from fastapi import FastAPI, HTTPException
+import aiohttp
+import aiofiles
+from fastapi import FastAPI
 from pydantic import BaseModel
-from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
-# Import your modified modules (Refactored from your scripts)
-# from agents.face_sim import FaceAgent
-# from agents.fb_detect import DocAgent
-# from agents.entity import EntityAgent
+# --- Import your actual Agents ---
+# Ensure these files are in the same directory or properly installed as modules
+from face_sim import FaceAgent
+from fb_detect import DocAgent
+from entity_agent import EntityAgent
 from scoring import VerificationScorer
 
-# --- MOCK CLASSES (Replace these with your actual imports) ---
-# I am writing wrappers here assuming you structure your existing files as classes
-class FaceAgent:
-    def compare(self, img1_url, img2_url):
-        # Your logic from face_sim.py
-        # Return: {"score": 85.5} or None
-        pass 
-
-class DocAgent:
-    def detect_and_crop(self, front_url, back_url):
-        # Your logic from fb_detect.py
-        # Logic: 
-        # 1. Download images
-        # 2. Run YOLO (model 1)
-        # 3. IF Front AND Back detected:
-        #       Crop the Front Card area
-        #       Return {"status": "success", "cropped_front_img": numpy_array}
-        # 4. ELSE:
-        #       Return {"status": "failed"}
-        pass
-
-class EntityAgent:
-    def extract(self, image_array):
-        # Your logic from entity.py
-        # Logic:
-        # 1. Run YOLO (model 2 - entities) on the cropped image
-        # 2. Run OCR
-        # 3. Return {"aadharnumber": "...", "dob": "...", "gender": "...", "age_status": "..."}
-        pass
-# -----------------------------------------------------------
-
 app = FastAPI()
-scorer = VerificationScorer()
 
-# Initialize Agents (Load models globally on startup)
-face_agent = FaceAgent()
-doc_agent = DocAgent()
-entity_agent = EntityAgent()
-thread_pool = ThreadPoolExecutor(max_workers=4)
+# --- Global State ---
+# We initialize agents here so models stay loaded in memory (RAM)
+face_agent = None
+doc_agent = None
+entity_agent = None
+scorer = None
 
-class VerificationRequest(BaseModel):
+TEMP_DIR = Path("temp")
+
+@app.on_event("startup")
+async def startup_event():
+    global face_agent, doc_agent, entity_agent, scorer
+    
+    # Create temp dir if not exists
+    TEMP_DIR.mkdir(exist_ok=True)
+
+    print("--- STARTING SYSTEM INITIALIZATION ---")
+    face_agent = FaceAgent()
+    doc_agent = DocAgent()
+    entity_agent = EntityAgent()
+    scorer = VerificationScorer()
+    print("--- SYSTEM READY ---")
+
+class VerifyRequest(BaseModel):
     selfie_url: str
-    front_aadhaar_url: str
-    back_aadhaar_url: str
-    expected_gender: str = None # Optional
+    front_url: str
+    back_url: str
+    gender: str = None  # Optional expected gender
 
-async def run_in_pool(func, *args):
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(thread_pool, func, *args)
+async def download_single(session, url, save_path):
+    try:
+        async with session.get(url, timeout=15) as resp:
+            if resp.status == 200:
+                async with aiofiles.open(save_path, 'wb') as f:
+                    await f.write(await resp.read())
+                return True
+    except Exception as e:
+        print(f"Download Error {url}: {e}")
+    return False
 
-@app.post("/verify")
-async def verify_user(data: VerificationRequest):
+async def setup_files(task_id, req: VerifyRequest):
     """
-    Main Verification Orchestrator
+    Downloads all 3 images to temp/{task_id}/ concurrently.
+    Returns: Dict of paths or None if failed.
     """
-    
-    # --- PARALLEL EXECUTION START ---
-    
-    # Task 1: Face Similarity (Selfie vs Front Url)
-    # We pass the raw Front URL because Face model handles full images well
-    task_face = run_in_pool(face_agent.compare, data.selfie_url, data.front_aadhaar_url)
-    
-    # Task 2: Document Check -> Entity Extraction (The Pipeline)
-    async def doc_entity_pipeline():
-        # Step A: Detect Front/Back
-        doc_result = await run_in_pool(doc_agent.detect_and_crop, data.front_aadhaar_url, data.back_aadhaar_url)
-        
-        if doc_result["status"] == "failed":
-            return {"status": "failed", "reason": "Front or Back Aadhaar not detected"}
-            
-        # Step B: Entity Extraction (Only if Doc check passed)
-        cropped_front = doc_result["cropped_front_img"]
-        entity_result = await run_in_pool(entity_agent.extract, cropped_front)
-        
-        return {"status": "success", "data": entity_result}
+    task_dir = TEMP_DIR / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
 
-    # Run both branches concurrently
-    face_result, pipeline_result = await asyncio.gather(task_face, doc_entity_pipeline())
-    
-    # --- PARALLEL EXECUTION END ---
-
-    # --- AGGREGATION & SCORING ---
-    
-    # 1. Check for Critical Failures
-    if pipeline_result["status"] == "failed":
-        return {
-            "verified": False,
-            "final_score": 0,
-            "status": "REJECTED",
-            "reason": pipeline_result["reason"]
-        }
-
-    # 2. Calculate Score
-    entity_data = pipeline_result["data"]
-    
-    # Prepare data for scorer
-    scoring_result = scorer.calculate_score(
-        face_data=face_result if face_result else {"similarity": 0},
-        entity_data=entity_data,
-        expected_gender=data.expected_gender
-    )
-    
-    return {
-        "verified": scoring_result["status"] == "APPROVED",
-        "final_score": scoring_result["total_score"],
-        "status": scoring_result["status"],
-        "details": {
-            "scores": scoring_result["breakdown"],
-            "extracted_data": {
-                "aadhaar": entity_data.get("aadharnumber"),
-                "dob": entity_data.get("dob"),
-                "gender": entity_data.get("gender")
-            },
-            "rejection_reasons": scoring_result["rejection_reasons"]
-        }
+    paths = {
+        "selfie": task_dir / "selfie.jpg",
+        "front": task_dir / "front.jpg",
+        "back": task_dir / "back.jpg"
     }
+
+    async with aiohttp.ClientSession() as session:
+        # Launch 3 downloads at once
+        results = await asyncio.gather(
+            download_single(session, req.selfie_url, paths["selfie"]),
+            download_single(session, req.front_url, paths["front"]),
+            download_single(session, req.back_url, paths["back"])
+        )
+
+    # Check if all downloads succeeded
+    if all(results):
+        return {k: str(v) for k, v in paths.items()} # Return string paths
+    else:
+        # Cleanup immediately if download failed
+        shutil.rmtree(task_dir)
+        return None
+
+@app.post("/verification/verify")
+async def verify_user(req: VerifyRequest):
+    task_id = str(uuid.uuid4())
+    print(f"[{task_id}] New Verification Request")
+
+    # 1. Download Files
+    files = await setup_files(task_id, req)
+    if not files:
+        return {"status": "FAILED", "reason": "Image Download Failed"}
+
+    try:
+        # 2. Parallel Execution (Face vs Doc+Entity)
+        
+        # Task A: Face Comparison (Selfie <-> Front Card)
+        # Note: FaceAgent is synchronous (CPU/GPU bound), so we run it in a thread
+        loop = asyncio.get_event_loop()
+        face_task = loop.run_in_executor(None, face_agent.compare, files['selfie'], files['front'])
+
+        # Task B: Document Pipeline
+        async def run_doc_pipeline():
+            # B1: Doc Check
+            # DocAgent is synchronous, run in thread
+            doc_res = await loop.run_in_executor(None, doc_agent.verify_documents, files['front'], files['back'])
+            
+            if not doc_res['success']:
+                return {"success": False, "reason": doc_res['message']}
+
+            # B2: Entity Extraction (Only if Doc Check Passed)
+            # We pass the coords so EntityAgent can crop instantly
+            front_coords = doc_res.get('front_coords')
+            
+            # EntityAgent is synchronous, run in thread
+            entity_res = await loop.run_in_executor(
+                None, 
+                entity_agent.extract_from_file, 
+                files['front'], 
+                front_coords
+            )
+            
+            return {"success": True, "data": entity_res.get('data', {}), "raw_entity_res": entity_res}
+
+        # Wait for both branches
+        face_score, doc_pipeline_res = await asyncio.gather(face_task, run_doc_pipeline())
+
+        # 3. Aggregation Logic
+        
+        # Check if Pipeline failed (e.g. invalid docs)
+        if not doc_pipeline_res['success']:
+            return {
+                "status": "REJECTED",
+                "score": 0,
+                "reason": doc_pipeline_res.get('reason', 'Document Verification Failed')
+            }
+
+        # 4. Scoring
+        entity_data = doc_pipeline_res['data']
+        
+        # Prepare inputs for scorer
+        # scorer expects: face_data dict, entity_data dict, expected_gender string
+        final_result = scorer.calculate_score(
+            face_data={"similarity": face_score},
+            entity_data=entity_data,
+            expected_gender=req.gender
+        )
+
+        return {
+            "task_id": task_id,
+            "final_decision": final_result['status'],
+            "score": final_result['total_score'],
+            "breakdown": final_result['breakdown'],
+            "extracted_data": {
+                "aadhaar": entity_data.get('aadharnumber'),
+                "dob": entity_data.get('dob'),
+                "gender": entity_data.get('gender')
+            },
+            "rejection_reasons": final_result['rejection_reasons']
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"status": "ERROR", "message": str(e)}
+
+    finally:
+        # 5. Cleanup
+        # Always delete the temp folder for this task
+        task_dir = TEMP_DIR / task_id
+        if task_dir.exists():
+            shutil.rmtree(task_dir)
+            print(f"[{task_id}] Cleanup Complete")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Workers=1 because our Agents hold heavy models in memory. 
+    # Multiple workers would duplicate models and crash RAM.
+    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)
