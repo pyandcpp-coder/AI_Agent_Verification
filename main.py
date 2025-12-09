@@ -122,6 +122,7 @@ async def setup_files(user_id: str, req: VerifyRequest):
 
 @app.post("/verification/verify")
 async def verify_user(req: VerifyRequest):
+    """Full verification endpoint with detailed breakdown (for testing/debugging)"""
     user_id = str(req.user_id)
     print(f"[{user_id}] New Verification Request")
 
@@ -246,6 +247,137 @@ async def verify_user(req: VerifyRequest):
     finally:
         # 6. Cleanup
         # Always delete the temp folder for this user after processing
+        if task_dir and task_dir.exists():
+            try:
+                shutil.rmtree(task_dir)
+                print(f"[{user_id}] Cleanup Complete")
+            except Exception as e:
+                print(f"[{user_id}] Cleanup Failed: {e}")
+
+@app.post("/verification/verify/agent/")
+async def verify_user_production(req: VerifyRequest):
+    """Production endpoint - returns only essential verification data"""
+    user_id = str(req.user_id)
+    print(f"[{user_id}] New Production Verification Request")
+
+    # 1. Setup Files (Download/Copy)
+    files, task_dir = await setup_files(user_id, req)
+    if not files:
+        return {
+            "user_id": user_id,
+            "final_decision": "REJECTED",
+            "status_code": 1,
+            "extracted_data": {
+                "aadhaar": None,
+                "dob": None,
+                "gender": None
+            }
+        }
+
+    try:
+        # 2. Parallel Execution Setup
+        loop = asyncio.get_event_loop()
+        
+        # --- TASK A: Face Check (CPU/GPU Bound) ---
+        face_task = loop.run_in_executor(
+            None, 
+            face_agent.compare, 
+            files['selfie'], 
+            files['front']
+        )
+
+        # --- TASK B: Doc & Entity Pipeline ---
+        async def run_doc_pipeline():
+            # B1: Document Verification
+            doc_res = await loop.run_in_executor(
+                None, 
+                doc_agent.verify_documents, 
+                files['front'], 
+                files['back']
+            )
+            
+            # Fail Fast: If detection fails, stop pipeline here
+            if not doc_res['success']:
+                return {"success": False, "reason": doc_res['message']}
+
+            # B2: Entity Extraction
+            front_coords = doc_res.get('front_coords')
+            entity_res = await loop.run_in_executor(
+                None, 
+                entity_agent.extract_from_file, 
+                files['front'], 
+                front_coords
+            )
+            
+            return {
+                "success": True, 
+                "data": entity_res.get('data', {})
+            }
+
+        # Execute both branches concurrently
+        face_score, doc_pipeline_res = await asyncio.gather(face_task, run_doc_pipeline())
+
+        # 3. Aggregation Logic
+        if not doc_pipeline_res['success']:
+            return {
+                "user_id": user_id,
+                "final_decision": "REJECTED",
+                "status_code": 1,
+                "extracted_data": {
+                    "aadhaar": None,
+                    "dob": None,
+                    "gender": None
+                }
+            }
+
+        # 4. Final Scoring
+        entity_data = doc_pipeline_res['data']
+        
+        expected_gender = req.gender.lower() if req.gender else None
+        expected_dob = req.dob if req.dob else None
+        
+        final_result = scorer.calculate_score(
+            face_data={"similarity": face_score},
+            entity_data=entity_data,
+            expected_gender=expected_gender,
+            expected_dob=expected_dob
+        )
+
+        # 5. Construct Production Response
+        status_code_map = {
+            "APPROVED": 2,
+            "REJECTED": 1,
+            "REVIEW": 0
+        }
+        status_code = status_code_map.get(final_result['status'], 0)
+        
+        return {
+            "user_id": user_id,
+            "final_decision": final_result['status'],
+            "status_code": status_code,
+            "extracted_data": {
+                "aadhaar": entity_data.get('aadharnumber'),
+                "dob": entity_data.get('dob'),
+                "gender": entity_data.get('gender')
+            }
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {
+            "user_id": user_id,
+            "final_decision": "REJECTED",
+            "status_code": 1,
+            "extracted_data": {
+                "aadhaar": None,
+                "dob": None,
+                "gender": None
+            }
+        }
+
+    finally:
+        # 6. Cleanup
         if task_dir and task_dir.exists():
             try:
                 shutil.rmtree(task_dir)
