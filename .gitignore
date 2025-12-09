@@ -9,3 +9,6 @@ pipeline_output/
 start_server.sh
 app/pipeline_reference.py
 .DS_Store
+test_corrected.json
+test_production_api.py
+test_results.txt
