@@ -491,36 +491,76 @@ def extract_main_fields(organized_results: Dict[str, Any]) -> Dict[str, Any]:
                     first_valid_text = next((text for text in all_texts if text), '')
                     if first_valid_text:
                         data[field] = first_valid_text
-                        
+    
+    # --- Aadhaar Number Validation ---
+    aadhar_status = "aadhar_approved"
     if data.get('aadharnumber'):
         aad = data['aadharnumber']
-
-        # detect masked aadhaar
-        if re.search(r'X{4}', aad, re.IGNORECASE):
-            return "masked_aadhar"
+        # Remove spaces for checking
+        aad_no_space = aad.replace(" ", "")
+        
+        # Check for masked aadhaar (4, 8, or 12 consecutive X's)
+        if re.search(r'X{4}', aad_no_space, re.IGNORECASE):
+            aadhar_status = "aadhar_disapproved"
+            logger.warning(f"Masked Aadhaar detected: {aad}")
+        else:
+            # Clean spaces for approved aadhaar
+            data['aadharnumber'] = aad_no_space
+    else:
+        aadhar_status = "aadhar_disapproved"
     
-        # clean spaces for real aadhaar
-        data['aadharnumber'] = aad.replace(" ", "")
-
+    data['aadhar_status'] = aadhar_status
+    
+    # --- DOB Processing and Age Verification ---
+    age_status = "age_disapproved"
+    parsed_dob = None
     
     if data.get('dob'):
         # Extract all digit groups from dob string
         digit_groups = re.findall(r'\d+', data['dob'])
         digits_only = ''.join(digit_groups)
+        
         # If 8 digits, try to parse as ddmmyyyy
         if len(digits_only) == 8:
             try:
-                parsed_date = datetime.strptime(digits_only, '%d%m%Y')
-                data['dob'] = parsed_date.strftime('%d-%m-%Y')
+                parsed_dob = datetime.strptime(digits_only, '%d%m%Y')
+                data['dob'] = parsed_dob.strftime('%d-%m-%Y')
             except ValueError:
                 data['dob'] = 'Invalid Format'
+                logger.warning(f"Invalid DOB format (8 digits): {digits_only}")
         else:
             # If dob contains a year (e.g., 'Year of Birth : 1991'), use the first 4-digit group as year
             year = next((g for g in digit_groups if len(g) == 4), None)
             if year:
-                data['dob'] = year
+                # Assume 1st January for year-only DOB
+                try:
+                    parsed_dob = datetime(int(year), 1, 1)
+                    data['dob'] = year
+                except ValueError:
+                    data['dob'] = 'Invalid Format'
+                    logger.warning(f"Invalid year in DOB: {year}")
             else:
                 data['dob'] = 'Invalid Format'
+                logger.warning(f"Could not extract valid DOB from: {data['dob']}")
+        
+        # Calculate age if DOB was successfully parsed
+        if parsed_dob:
+            today = datetime.now()
+            age = today.year - parsed_dob.year - ((today.month, today.day) < (parsed_dob.month, parsed_dob.day))
+            data['age'] = age
+            
+            # Check if age is 18 or above
+            if age >= 18:
+                age_status = "age_approved"
+                logger.info(f"Age verification passed: {age} years old")
+            else:
+                logger.warning(f"Age verification failed: {age} years old (must be 18+)")
+        else:
+            data['age'] = None
+    else:
+        data['age'] = None
+    
+    data['age_status'] = age_status
     
     # --- Gender normalization (improved logic) ---
     if data['gender']:
@@ -622,17 +662,20 @@ async def extract_entities(request: EntityExtractionRequest):
             }
         )
 
-    # Extract only the three required fields
+    # Extract fields and perform validations
     extracted_data = extract_main_fields(organized)
     
-    # Prepare clean response with only the three entities
+    # Prepare response with entities and validation statuses
     response_data = {
         "aadharnumber": extracted_data.get("aadharnumber", ""),
         "dob": extracted_data.get("dob", ""),
-        "gender": extracted_data.get("gender", "")
+        "gender": extracted_data.get("gender", ""),
+        "age": extracted_data.get("age"),
+        "aadhar_status": extracted_data.get("aadhar_status", "aadhar_disapproved"),
+        "age_status": extracted_data.get("age_status", "age_disapproved")
     }
     
-    logger.info(f"[task_id={task_id}] Entity extraction completed successfully")
+    logger.info(f"[task_id={task_id}] Entity extraction completed - Aadhaar: {response_data['aadhar_status']}, Age: {response_data['age_status']}")
     
     return JSONResponse(
         status_code=200,
