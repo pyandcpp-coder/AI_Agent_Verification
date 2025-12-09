@@ -1,139 +1,75 @@
-from fastapi import FastAPI, HTTPException
-from ultralytics import YOLO
-import requests
-import numpy as np
 import cv2
-import uvicorn
+from ultralytics import YOLO
 
-app = FastAPI()
+class DocAgent:
+    def __init__(self, model_path="models/best4.pt"):
+        # Load model once when server starts
+        print(f"Loading Document Model from {model_path}...")
+        self.model = YOLO(model_path)
+        self.conf_threshold = 0.65
 
-# Load model
-model = YOLO("models/best4.pt")
-
-# Configuration
-CONFIDENCE_THRESHOLD = 0.70
-
-def next_process(image_array):
-    """
-    Placeholder for the next step (e.g., OCR, cropping, saving).
-    Receives the numpy/cv2 image array of the Front Aadhaar.
-    """
-    # Example logic: Get image dimensions to prove we have the image
-    height, width, _ = image_array.shape
-    print(f"Processing Front Aadhaar. Size: {width}x{height}")
-    
-    # Return whatever result this process generates
-    return {
-        "status": "success", 
-        "message": "Front Aadhaar processed successfully",
-        "image_shape": [height, width]
-    }
-
-def process_image(url):
-    """
-    Downloads image, runs detection, and filters by threshold.
-    Returns: (image_array, detected_label, confidence_score)
-    """
-    try:
-        # 1. Download image
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        img_bytes = resp.content
-
-        # 2. Convert bytes to CV2 image
-        img = cv2.imdecode(
-            np.frombuffer(img_bytes, np.uint8),
-            cv2.IMREAD_COLOR
-        )
-        if img is None:
-            return None, None, 0.0
-
-        # 3. Detect
-        results = model(img)
-
+    def _detect(self, img):
+        """Helper to run detection on a single loaded image"""
+        results = self.model(img, verbose=False)
+        
         best_label = None
         max_conf = 0.0
+        best_box = None
 
-        # 4. Check results and filter by Threshold
         for box in results[0].boxes:
             conf = float(box.conf)
             cls_id = int(box.cls)
-            label = model.names[cls_id]
+            label = self.model.names[cls_id]
 
-            # Logic: We want the highest confidence detection that passes the threshold
-            if conf >= CONFIDENCE_THRESHOLD and conf > max_conf:
+            # We want the highest confidence detection that passes threshold
+            if conf >= self.conf_threshold and conf > max_conf:
                 max_conf = conf
                 best_label = label
+                # Box format: [x1, y1, x2, y2] (Standard for cropping)
+                best_box = box.xyxy[0].cpu().numpy().astype(int)
 
-        return img, best_label, max_conf
+        return best_label, max_conf, best_box
 
-    except Exception as e:
-        print(f"Error processing image: {e}")
-        return None, None, 0.0
+    def verify_documents(self, front_path, back_path):
+        """
+        1. Reads images from local temp folder.
+        2. Checks if Front and Back are present.
+        3. Returns coordinates of the Front card for the next step.
+        """
+        # 1. Read Images
+        img_f = cv2.imread(front_path)
+        img_b = cv2.imread(back_path)
 
+        if img_f is None:
+            return {"success": False, "message": f"Could not read file: {front_path}"}
+        if img_b is None:
+            return {"success": False, "message": f"Could not read file: {back_path}"}
 
-@app.get("/aadhaar/detect")
-async def detect_and_process(front_url: str, back_url: str):
-    
-    # Process both images to find out what they are
-    img1, label1, conf1 = process_image(front_url)
-    img2, label2, conf2 = process_image(back_url)
+        # 2. Run Detection
+        label_f, conf_f, box_f = self._detect(img_f)
+        label_b, conf_b, box_b = self._detect(img_b)
 
-    # Check if images failed to load
-    if img1 is None or img2 is None:
-        raise HTTPException(status_code=400, detail="Failed to download or decode one of the images.")
+        # 3. Validate Presence (Fail Fast)
+        # Note: Ensure your YOLO labels are 'front' and 'back' (lowercase)
+        front_detected = label_f and "front" in label_f.lower()
+        back_detected = label_b and "back" in label_b.lower()
 
-    detected_front_img = None
-    detection_info = {}
-
-    # --- LOGIC TO IDENTIFY FRONT AADHAAR ---
-    
-    # Note: Adjust "front" and "back" strings to match exactly what your model.names returns
-    # We convert to lower() just to be safe.
-    
-    # Check Image 1
-    if label1 and "front" in label1.lower():
-        detected_front_img = img1
-        detection_info['url_1'] = f"Detected Front ({conf1})"
-    elif label1:
-        detection_info['url_1'] = f"Detected {label1} ({conf1})"
-    else:
-        detection_info['url_1'] = "No detection above threshold"
-
-    # Check Image 2 (Only if Image 1 wasn't already the front, or if we want to pick the best one)
-    if label2 and "front" in label2.lower():
-        # If we already found a front in img1, usually we pick the higher confidence
-        if detected_front_img is not None:
-            if conf2 > conf1:
-                detected_front_img = img2
-                detection_info['url_2'] = f"Detected Front ({conf2}) - SELECTED"
-                detection_info['url_1'] = f"Detected Front ({conf1}) - IGNORED (Lower Conf)"
-        else:
-            detected_front_img = img2
-            detection_info['url_2'] = f"Detected Front ({conf2})"
-    elif label2:
-        detection_info['url_2'] = f"Detected {label2} ({conf2})"
-    else:
-        detection_info['url_2'] = "No detection above threshold"
-
-
-    # --- FINAL DECISION ---
-
-    if detected_front_img is not None:
-        # Pass ONLY the front image to the next process
-        next_step_result = next_process(detected_front_img)
+        if not front_detected:
+            return {
+                "success": False, 
+                "message": f"Front Aadhaar not detected. Found: {label_f} ({conf_f:.2f})"
+            }
         
-        return {
-            "detection_summary": detection_info,
-            "next_process_result": next_step_result
-        }
-    else:
-        # If no front card was found above 0.70 threshold
-        return {
-            "status": "failed",
-            "message": "No valid Aadhaar Front detected above 0.70 threshold.",
-            "detection_summary": detection_info
-        }
+        if not back_detected:
+            return {
+                "success": False, 
+                "message": f"Back Aadhaar not detected. Found: {label_b} ({conf_b:.2f})"
+            }
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8006)
+        # 4. Success - Return the coordinates!
+        # We return box_f so the Entity Agent can crop perfectly.
+        return {
+            "success": True,
+            "message": "Both documents verified",
+            "front_coords": box_f.tolist()  # Convert numpy array to list [x1, y1, x2, y2]
+        }

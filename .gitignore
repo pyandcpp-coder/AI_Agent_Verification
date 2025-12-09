@@ -8,3 +8,4 @@ models/
 pipeline_output/
 start_server.sh
 app/pipeline_reference.py
+.DS_Store
