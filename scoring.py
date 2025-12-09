@@ -30,7 +30,13 @@ class VerificationScorer:
 
         # --- 1. Face Similarity (0 - 40 points) ---
         face_sim = face_data.get("similarity", 0)
-        if face_sim >= 40:
+        
+        # Critical: Face match below 15% -> Auto Reject
+        if face_sim < 15:
+            breakdown["face_score"] = 0
+            critical_failure = True
+            rejection_reasons.append(f"Face Not Matching (Similarity: {face_sim:.2f}%)")
+        elif face_sim >= 40:
             face_points = min(40, (face_sim / 100) * 40 * 1.5)
             if face_sim > 70: face_points = 40
             score += face_points
@@ -38,22 +44,22 @@ class VerificationScorer:
         else:
             breakdown["face_score"] = 0
             rejection_reasons.append(f"Low Face Match ({face_sim:.2f}%)")
-            # Optional: Make face mismatch critical? 
-            # For now, we just give 0 points, but usually < 40% is a reject.
-            if face_sim < 25: 
-                critical_failure = True
-                rejection_reasons.append("Face Mismatch Critical")
 
         # --- 2. Aadhaar Validity (0 - 20 points) ---
         aadhaar_num = entity_data.get("aadharnumber", "").replace(" ", "")
-        if len(aadhaar_num) == 12 and aadhaar_num.isdigit():
+        # Check for XXXX masked numbers or invalid format
+        if "XXXX" in entity_data.get("aadharnumber", "") or "xxxx" in entity_data.get("aadharnumber", ""):
+            breakdown["aadhar_score"] = 0
+            critical_failure = True
+            rejection_reasons.append("Aadhaar Number is Masked (XXXX)")
+        elif len(aadhaar_num) == 12 and aadhaar_num.isdigit():
             score += self.weights["aadhar"]
             breakdown["aadhar_score"] = self.weights["aadhar"]
         else:
             breakdown["aadhar_score"] = 0
             rejection_reasons.append("Invalid/Unreadable Aadhaar Number")
 
-        # --- 3. DOB & Age Check (STRICT) ---
+        # --- 3. DOB & Age Check ---
         extracted_dob = entity_data.get("dob", "")
         age_status = entity_data.get("age_status") # Calculated in entity.py
         
@@ -68,18 +74,18 @@ class VerificationScorer:
                 if norm_input and norm_extracted and norm_input == norm_extracted:
                     dob_score = self.weights["dob"]
                 elif norm_input and norm_extracted:
-                    # Mismatch -> Critical Failure
+                    # DOB Mismatch -> Critical Failure (REJECT)
                     dob_score = 0
                     critical_failure = True
                     rejection_reasons.append(f"DOB Mismatch (Input: {expected_dob} vs Aadhaar: {extracted_dob})")
                 else:
-                    # Could not parse one of them, but Age is 18+ -> Pass with warning
+                    # Could not parse one of them, but Age is 18+ -> Give points
                     dob_score = self.weights["dob"]
             else:
-                # No input DOB to cross-check, but Age is 18+ -> Pass
+                # No input DOB to cross-check, but Age is 18+ -> Give points
                 dob_score = self.weights["dob"]
         else:
-            # Under 18 or Invalid DOB -> Critical Failure
+            # Under 18 -> Critical Failure (REJECT)
             dob_score = 0
             critical_failure = True
             rejection_reasons.append("User is Under 18 or DOB Unreadable")
@@ -87,7 +93,7 @@ class VerificationScorer:
         score += dob_score
         breakdown["dob_score"] = dob_score
 
-        # --- 4. Gender Check (STRICT) ---
+        # --- 4. Gender Check (Non-Critical - Just affects score) ---
         # Normalize: "Male", "male", "M" -> "male"
         extracted_gen = entity_data.get("gender", "").lower()
         input_gen = expected_gender.lower() if expected_gender else ""
@@ -103,24 +109,25 @@ class VerificationScorer:
             if clean_gender(input_gen) == clean_gender(extracted_gen):
                 gender_score = self.weights["gender"]
             else:
-                # Mismatch -> Critical Failure
+                # Gender Mismatch -> Just 0 points, not critical
                 gender_score = 0
-                critical_failure = True
                 rejection_reasons.append(f"Gender Mismatch (Input: {input_gen} vs Aadhaar: {extracted_gen})")
         elif not extracted_gen:
-             # If we can't read gender from card, we can't verify -> Fail
-             critical_failure = True
-             rejection_reasons.append("Gender Unreadable on Aadhaar")
+            # Gender unreadable -> Just 0 points, not critical
+            rejection_reasons.append("Gender Unreadable on Aadhaar")
         
         score += gender_score
         breakdown["gender_score"] = gender_score
 
-        # --- FINAL DECISION ---
+        # --- FINAL DECISION BASED ON SCORE ---
+        # Critical failures: DOB mismatch, Age < 18, XXXX in Aadhaar
         if critical_failure:
             status = "REJECTED"
-        elif score >= 70:
+        elif score >= 65:
             status = "APPROVED"
-        else:
+        elif 40 <= score < 65:
+            status = "REVIEW"
+        else:  # score < 40
             status = "REJECTED"
 
         return {

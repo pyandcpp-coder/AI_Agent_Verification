@@ -208,9 +208,18 @@ async def verify_user(req: VerifyRequest):
         )
 
         # 5. Construct Final Response
+        # Map status to status code
+        status_code_map = {
+            "APPROVED": 2,
+            "REJECTED": 1,
+            "IN_REVIEW": 0
+        }
+        status_code = status_code_map.get(final_result['status'], 0)
+        
         return {
             "user_id": user_id,
             "final_decision": final_result['status'],
+            "status_code": status_code,
             "score": final_result['total_score'],
             "breakdown": final_result['breakdown'],
             "extracted_data": {
