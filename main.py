@@ -13,12 +13,14 @@ try:
     from app.face_sim import FaceAgent
     from app.fb_detect import DocAgent
     from app.entity import EntityAgent
+    from app.gender_pipeline import GenderPipeline
     from scoring import VerificationScorer
 except ImportError:
     # Fallback for flat directory structures
     from face_sim import FaceAgent
     from fb_detect import DocAgent
     from entity import EntityAgent
+    from gender_pipeline import GenderPipeline
     from scoring import VerificationScorer
 
 app = FastAPI()
@@ -27,6 +29,7 @@ app = FastAPI()
 face_agent = None
 doc_agent = None
 entity_agent = None
+gender_pipeline = None
 scorer = None
 
 TEMP_DIR = Path("temp")
