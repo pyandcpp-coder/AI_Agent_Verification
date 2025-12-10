@@ -23,8 +23,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class EntityAgent:
-    def __init__(self, model_path="models/best.pt", other_lang_code='hin+tel+ben'):
-        # --- Device Selection ---
+    def __init__(self, model_path="models/best.pt"):
+
         if torch.cuda.is_available():
             self.device = "cuda"
             logger.info(f"CUDA is available. Models will run on GPU ({torch.cuda.get_device_name(0)}).")
@@ -43,7 +43,7 @@ class EntityAgent:
         logger.info("Loading entity detection model from filesystem...")
         self.model2 = YOLO(self.entity_model_path)
         
-        self.other_lang_code = other_lang_code
+        # self.other_lang_code = other_lang_code
         self._check_tesseract()
 
         logger.info("YOLOv8 entity detection model loaded successfully.")
