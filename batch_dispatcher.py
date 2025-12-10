@@ -8,16 +8,13 @@ from pathlib import Path
 
 
 BASE_URL = "https://qoneqt.com/v1/api"
-ADMIN_ID = 27  # Your Main Admin ID
-AGENT_ID = 77 # The Specific Agent ID you are running (Change this for other instances: 77, 78, 79, 80)
+ADMIN_ID = 27  
+AGENT_IDS = [77, 78, 79, 80]  # List of agents to process in rotation
 BATCH_SIZE = 20
 TTL_HOURS = 12
 
-
-
 LOCAL_AI_URL = "http://localhost:8100/verification/verify/agent/"
 
-# Create logs directory structure
 LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(exist_ok=True)
 
@@ -29,7 +26,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Browser-like Headers to bypass Cloudflare
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -47,24 +43,26 @@ HEADERS = {
     "sec-ch-ua-platform": '"macOS"'
 }
 
-# Session tracking for batch runs
+
 current_session = {
     "session_id": None,
     "start_time": None,
     "batch_number": 0,
-    "users_processed": []
+    "users_processed": [],
+    "agent_id": None
 }
 
-def create_session_log_file():
+def create_session_log_file(agent_id):
     """Create a new session log file for this run"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    current_session["session_id"] = f"agent_{AGENT_ID}_{timestamp}"
+    current_session["session_id"] = f"agent_{agent_id}_{timestamp}"
     current_session["start_time"] = datetime.now().isoformat()
     current_session["batch_number"] = 0
     current_session["users_processed"] = []
+    current_session["agent_id"] = agent_id
     
     # Create agent-specific directory
-    agent_dir = LOGS_DIR / f"agent_{AGENT_ID}"
+    agent_dir = LOGS_DIR / f"agent_{agent_id}"
     agent_dir.mkdir(exist_ok=True)
     
     # Create session directory
@@ -90,7 +88,7 @@ def save_batch_summary(session_dir, batch_data):
     summary = {
         "batch_number": current_session["batch_number"],
         "timestamp": datetime.now().isoformat(),
-        "agent_id": AGENT_ID,
+        "agent_id": current_session["agent_id"],
         "total_users": len(batch_data),
         "users": batch_data
     }
@@ -106,7 +104,7 @@ def save_session_summary(session_dir):
     
     summary = {
         "session_id": current_session["session_id"],
-        "agent_id": AGENT_ID,
+        "agent_id": current_session["agent_id"],
         "start_time": current_session["start_time"],
         "end_time": datetime.now().isoformat(),
         "total_batches": current_session["batch_number"],
@@ -121,14 +119,27 @@ def save_session_summary(session_dir):
     logger.info(f"💾 Saved session summary: {session_file.name}")
 
 def calculate_session_statistics(session_dir):
-    """Calculate statistics from all user logs in the session"""
+    """Calculate detailed statistics from all user logs in the session"""
     stats = {
         "approved": 0,
         "rejected": 0,
         "review": 0,
         "failed": 0,
-        "total_processing_time": 0
+        "total_processing_time": 0,
+        "total_score": 0,
+        "rejection_reasons": [],
+        "avg_score_approved": 0,
+        "avg_score_rejected": 0,
+        "breakdown_summary": {
+            "face_similarity": [],
+            "age_verification": [],
+            "gender_match": [],
+            "dob_match": []
+        }
     }
+    
+    approved_scores = []
+    rejected_scores = []
     
     # Read all user log files
     for user_file in session_dir.glob("user_*.json"):
@@ -136,33 +147,78 @@ def calculate_session_statistics(session_dir):
             with open(user_file, 'r') as f:
                 user_data = json.load(f)
                 
-            decision = user_data.get("final_result", {}).get("final_decision", "FAILED")
+            final_result = user_data.get("final_result", {})
+            decision = final_result.get("final_decision", "FAILED")
+            score = final_result.get("score", 0)
+            breakdown = final_result.get("breakdown", {})
+            
             if decision == "APPROVED":
                 stats["approved"] += 1
+                approved_scores.append(score)
             elif decision == "REJECTED":
                 stats["rejected"] += 1
+                rejected_scores.append(score)
+                # Collect rejection reasons
+                stats["rejection_reasons"].extend(final_result.get("rejection_reasons", []))
             elif decision == "REVIEW":
                 stats["review"] += 1
             else:
                 stats["failed"] += 1
             
             stats["total_processing_time"] += user_data.get("timing", {}).get("total_time", 0)
-        except:
+            stats["total_score"] += score
+            
+            # Collect breakdown data
+            if breakdown:
+                for key in stats["breakdown_summary"].keys():
+                    if key in breakdown:
+                        stats["breakdown_summary"][key].append(breakdown[key])
+        except Exception as e:
+            logger.error(f"Error processing stats for {user_file}: {e}")
             pass
     
-    if stats["approved"] + stats["rejected"] + stats["review"] + stats["failed"] > 0:
-        stats["avg_processing_time"] = stats["total_processing_time"] / (stats["approved"] + stats["rejected"] + stats["review"] + stats["failed"])
+    total_users = stats["approved"] + stats["rejected"] + stats["review"] + stats["failed"]
+    
+    if total_users > 0:
+        stats["avg_processing_time"] = stats["total_processing_time"] / total_users
+        stats["avg_score"] = stats["total_score"] / total_users
     else:
         stats["avg_processing_time"] = 0
+        stats["avg_score"] = 0
+    
+    if approved_scores:
+        stats["avg_score_approved"] = sum(approved_scores) / len(approved_scores)
+    if rejected_scores:
+        stats["avg_score_rejected"] = sum(rejected_scores) / len(rejected_scores)
+    
+    # Count rejection reasons
+    from collections import Counter
+    if stats["rejection_reasons"]:
+        reason_counts = Counter(stats["rejection_reasons"])
+        stats["top_rejection_reasons"] = dict(reason_counts.most_common(10))
+    else:
+        stats["top_rejection_reasons"] = {}
+    
+    # Calculate average breakdown scores
+    for key, values in stats["breakdown_summary"].items():
+        if values:
+            stats["breakdown_summary"][key] = {
+                "avg": sum(values) / len(values),
+                "min": min(values),
+                "max": max(values),
+                "count": len(values)
+            }
+        else:
+            stats["breakdown_summary"][key] = {"avg": 0, "min": 0, "max": 0, "count": 0}
     
     return stats
 
-async def lock_batch(session):
+async def lock_batch(session, agent_id):
     """Step 1: Lock a batch of users for this agent"""
     url = f"{BASE_URL}/admin/kyc-lock-batch"
     payload = {
         "admin_id": ADMIN_ID,
-        "target_admin_id": AGENT_ID,
+        "target_admin_id": agent_id,
         "batch_size": BATCH_SIZE,
         "ttl_hours": TTL_HOURS
     }
@@ -172,7 +228,7 @@ async def lock_batch(session):
             if resp.status == 200:
                 data = await resp.json()
                 if data.get("success"):
-                    logger.info(f"🔒 Locked {data.get('locked_count')} users for Agent {AGENT_ID}")
+                    logger.info(f"🔒 Locked {data.get('locked_count')} users for Agent {agent_id}")
                     return data.get("kyc_ids", [])
                 else:
                     logger.error(f"Failed to lock batch: {data.get('message')}")
@@ -182,15 +238,37 @@ async def lock_batch(session):
         logger.error(f"Lock Batch Exception: {e}")
     return []
 
-async def fetch_user_details(session):
+async def release_batch(session, agent_id):
+    """Release the batch for an agent after processing"""
+    url = f"{BASE_URL}/admin/kyc-release-batch"
+    payload = {
+        "admin_id": ADMIN_ID,
+        "target_admin_id": agent_id
+    }
+    
+    try:
+        async with session.post(url, json=payload, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=25)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if data.get("success"):
+                    logger.info(f"🔓 Released batch for Agent {agent_id}")
+                    return True
+                else:
+                    logger.error(f"Failed to release batch for Agent {agent_id}: {data.get('message')}")
+            else:
+                logger.error(f"Release Batch API Error {resp.status}: {await resp.text()}")
+    except Exception as e:
+        logger.error(f"Release Batch Exception for Agent {agent_id}: {e}")
+    return False
+
+async def fetch_user_details(session, agent_id):
     """Step 2: Get details for the assigned users"""
     url = f"{BASE_URL}/admin/verify-list"
-    # Note: 'admin_id' here acts as the filter for the assigned agent
     payload = {
-        "admin_id": AGENT_ID, 
+        "admin_id": agent_id, 
         "page": 1,
         "limit": BATCH_SIZE,
-        "statusFilter": "2",  # Pending?
+        "statusFilter": "2",  
         "isFullSearch": True,
         "offset": 0,
         "type": "0",
@@ -202,7 +280,7 @@ async def fetch_user_details(session):
             if resp.status == 200:
                 data = await resp.json()
                 users = data.get("data", [])
-                logger.info(f"📥 Fetched details for {len(users)} users")
+                logger.info(f" Fetched details for {len(users)} users")
                 return users
             else:
                 logger.error(f"Fetch Details Error {resp.status}: {await resp.text()}")
@@ -210,14 +288,13 @@ async def fetch_user_details(session):
         logger.error(f"Fetch Details Exception: {e}")
     return []
 
-async def process_single_user(session, user, session_dir):
+async def process_single_user(session, user, session_dir, agent_id):
     """Step 3 & 4: Process via Local AI and Push Result"""
     user_id = user.get("user_id")
     
-    # Initialize comprehensive log for this user
     user_log = {
         "user_id": user_id,
-        "agent_id": AGENT_ID,
+        "agent_id": agent_id,
         "session_id": current_session["session_id"],
         "batch_number": current_session["batch_number"] + 1,
         "timestamp": datetime.now().isoformat(),
@@ -305,7 +382,7 @@ async def process_single_user(session, user, session_dir):
                         "message": f"AI processing failed with status {resp.status}",
                         "error": error_text
                     })
-                    logger.error(f"❌ User {user_id}: Local AI Failed ({resp.status})")
+                    logger.error(f" User {user_id}: Local AI Failed ({resp.status})")
                     user_log["final_result"] = {
                         "final_decision": "FAILED",
                         "status_code": -1,
@@ -327,9 +404,18 @@ async def process_single_user(session, user, session_dir):
                     "message": "AI processing completed successfully",
                     "processing_time": ai_elapsed,
                     "ai_decision": ai_result.get("final_decision"),
+                    "ai_score": ai_result.get("score", 0),
+                    "ai_breakdown": ai_result.get("breakdown", {}),
                     "ai_rejection_reasons": ai_result.get("rejection_reasons", []),
+                    "ai_extracted_data": ai_result.get("extracted_data", {}),
                     "ai_result": ai_result
                 })
+                
+                # Log detailed decision information
+                decision_details = f"Decision: {ai_result.get('final_decision')} | Score: {ai_result.get('score', 0)}"
+                if ai_result.get('rejection_reasons'):
+                    decision_details += f" | Reasons: {', '.join(ai_result.get('rejection_reasons', []))}"
+                logger.info(f"  User {user_id}: {decision_details}")
                 
         except asyncio.TimeoutError:
             ai_elapsed = time.time() - ai_start_time
@@ -341,7 +427,7 @@ async def process_single_user(session, user, session_dir):
                 "message": "AI processing timed out",
                 "elapsed_time": ai_elapsed
             })
-            logger.error(f"❌ User {user_id}: Local AI Timeout")
+            logger.error(f" User {user_id}: Local AI Timeout")
             user_log["final_result"] = {
                 "final_decision": "FAILED",
                 "status_code": -1,
@@ -356,7 +442,7 @@ async def process_single_user(session, user, session_dir):
         push_url = f"{BASE_URL}/ai-agent"
         push_payload = {
             "user_id": user_id,
-            "agent_id": str(AGENT_ID),
+            "agent_id": str(agent_id),
             "final_decision": ai_result.get("final_decision", "REJECTED"),
             "status_code": ai_result.get("status_code", 0),
             "extracted_data": ai_result.get("extracted_data", {}),
@@ -388,13 +474,19 @@ async def process_single_user(session, user, session_dir):
                         "status": "success",
                         "message": "Result successfully pushed to main server",
                         "push_time": push_elapsed,
-                        "server_response": push_result
+                        "server_response": push_result,
+                        "pushed_data": {
+                            "final_decision": push_payload['final_decision'],
+                            "status_code": push_payload['status_code'],
+                            "rejection_reasons": push_payload['rejection_reasons'],
+                            "extracted_data": push_payload['extracted_data']
+                        }
                     })
                     
-                    # Log with rejection reasons if available
-                    decision_log = f"{push_payload['final_decision']}"
+                    # Log with detailed information
+                    decision_log = f"{push_payload['final_decision']} (Code: {push_payload['status_code']})"
                     if push_payload['rejection_reasons']:
-                        decision_log += f" - Reasons: {', '.join(push_payload['rejection_reasons'])}"
+                        decision_log += f" | Reasons: {', '.join(push_payload['rejection_reasons'])}"
                     logger.info(f"✅ User {user_id}: Processed & Pushed ({decision_log})")
                 else:
                     error_text = await push_resp.text()
@@ -411,7 +503,7 @@ async def process_single_user(session, user, session_dir):
                         "error": error_text
                     })
                     
-                    logger.error(f"⚠️ User {user_id}: Failed to Push Result {push_resp.status} - {error_text[:100]}")
+                    logger.error(f" User {user_id}: Failed to Push Result {push_resp.status} - {error_text[:100]}")
                     
         except Exception as push_error:
             push_elapsed = time.time() - push_start_time
@@ -424,14 +516,25 @@ async def process_single_user(session, user, session_dir):
                 "error": str(push_error),
                 "elapsed_time": push_elapsed
             })
-            logger.error(f"🔥 User {user_id}: Push Exception - {push_error}")
+            logger.error(f" User {user_id}: Push Exception - {push_error}")
         
-        # Store final result
+        # Store final result with detailed breakdown
         user_log["final_result"] = {
             "final_decision": ai_result.get("final_decision", "REJECTED"),
             "status_code": ai_result.get("status_code", 0),
+            "score": ai_result.get("score", 0),
+            "breakdown": ai_result.get("breakdown", {}),
             "extracted_data": ai_result.get("extracted_data", {}),
-            "rejection_reasons": ai_result.get("rejection_reasons", [])
+            "rejection_reasons": ai_result.get("rejection_reasons", []),
+            "decision_summary": {
+                "is_approved": ai_result.get("final_decision") == "APPROVED",
+                "is_rejected": ai_result.get("final_decision") == "REJECTED",
+                "is_review": ai_result.get("final_decision") == "REVIEW",
+                "total_issues": len(ai_result.get("rejection_reasons", [])),
+                "extracted_aadhaar": ai_result.get("extracted_data", {}).get("aadhaar"),
+                "extracted_dob": ai_result.get("extracted_data", {}).get("dob"),
+                "extracted_gender": ai_result.get("extracted_data", {}).get("gender")
+            }
         }
 
     except Exception as e:
@@ -450,7 +553,7 @@ async def process_single_user(session, user, session_dir):
             "rejection_reasons": [f"Critical exception: {str(e)}"],
             "extracted_data": {}
         }
-        logger.error(f"🔥 User {user_id} Exception: {e}")
+        logger.error(f" User {user_id} Exception: {e}")
     
     # Calculate timing
     total_time = time.time() - start_time
@@ -476,83 +579,134 @@ async def process_single_user(session, user, session_dir):
     
     return user_log
 
-async def run_pipeline():
-    # Create session log directory
-    session_dir = create_session_log_file()
-    logger.info(f"📁 Session logs will be saved to: {session_dir}")
+async def process_agent_batch(session, agent_id, session_dir):
+    """Process a single batch for a specific agent"""
+    logger.info(f"--- Starting Cycle for Agent {agent_id} ---")
     
+    # 1. Lock Batch
+    locked_ids = await lock_batch(session, agent_id)
+    
+    if not locked_ids:
+        logger.info(f"No users available to lock for Agent {agent_id}")
+        return False
+    
+    # 2. Fetch User Details
+    users_to_process = await fetch_user_details(session, agent_id)
+    
+    if not users_to_process:
+        logger.warning(f"Locked batch for Agent {agent_id} but got no user details. Releasing batch...")
+        await release_batch(session, agent_id)
+        return False
+    
+    # 3. Process Batch
+    batch_start_time = time.time()
+    batch_results = []
+    
+    # Process in chunks of 5 users at a time
+    chunk_size = 5
+    for i in range(0, len(users_to_process), chunk_size):
+        chunk = users_to_process[i:i + chunk_size]
+        tasks = [process_single_user(session, u, session_dir, agent_id) for u in chunk]
+        chunk_results = await asyncio.gather(*tasks)
+        batch_results.extend(chunk_results)
+    
+    batch_elapsed = time.time() - batch_start_time
+    
+    # Create batch summary with detailed information
+    batch_summary = []
+    for user_log in batch_results:
+        if user_log:
+            final_result = user_log["final_result"]
+            batch_summary.append({
+                "user_id": user_log["user_id"],
+                "final_decision": final_result.get("final_decision"),
+                "status_code": final_result.get("status_code"),
+                "score": final_result.get("score", 0),
+                "breakdown": final_result.get("breakdown", {}),
+                "rejection_reasons": final_result.get("rejection_reasons", []),
+                "extracted_data": final_result.get("extracted_data", {}),
+                "processing_time": user_log["timing"].get("total_time"),
+                "errors": len(user_log["errors"]),
+                "has_errors": len(user_log["errors"]) > 0
+            })
+    
+    # Save batch summary
+    save_batch_summary(session_dir, {
+        "batch_elapsed_time": batch_elapsed,
+        "users": batch_summary
+    })
+    
+    # Calculate and log batch statistics
+    approved = sum(1 for u in batch_summary if u['final_decision'] == 'APPROVED')
+    rejected = sum(1 for u in batch_summary if u['final_decision'] == 'REJECTED')
+    review = sum(1 for u in batch_summary if u['final_decision'] == 'REVIEW')
+    
+    logger.info(f"--- Batch Complete for Agent {agent_id}. Processed {len(batch_results)} users in {batch_elapsed:.2f}s ---")
+    logger.info(f"📊 Results: ✅ {approved} Approved | ❌ {rejected} Rejected | ⏳ {review} Review")
+    
+    # Log common rejection reasons if any
+    all_rejection_reasons = []
+    for u in batch_summary:
+        all_rejection_reasons.extend(u.get('rejection_reasons', []))
+    
+    if all_rejection_reasons:
+        from collections import Counter
+        reason_counts = Counter(all_rejection_reasons)
+        logger.info(f"🔍 Top Rejection Reasons:")
+        for reason, count in reason_counts.most_common(5):
+            logger.info(f"   • {reason}: {count} times")
+    
+    # 4. Release the batch for this agent
+    await release_batch(session, agent_id)
+    
+    return True
+
+async def run_pipeline():
+    """Main pipeline that cycles through all agents continuously"""
     async with aiohttp.ClientSession() as session:
         try:
+            agent_sessions = {}
+            
+            # Create session directories for each agent
+            for agent_id in AGENT_IDS:
+                session_dir = create_session_log_file(agent_id)
+                agent_sessions[agent_id] = session_dir
+                logger.info(f"📁 Agent {agent_id} logs will be saved to: {session_dir}")
+            
+            logger.info(f"🚀 Starting continuous processing loop for Agents: {AGENT_IDS}")
+            
             while True:
-                logger.info(f"--- Starting Cycle for Agent {AGENT_ID} ---")
+                # Cycle through each agent
+                for agent_id in AGENT_IDS:
+                    session_dir = agent_sessions[agent_id]
+                    
+                    # Process one batch for this agent
+                    processed = await process_agent_batch(session, agent_id, session_dir)
+                    
+                    if not processed:
+                        logger.info(f"No work available for Agent {agent_id}, moving to next agent...")
+                    
+                    # Small delay between agents
+                    await asyncio.sleep(1)
                 
-                # 1. Lock Batch
-                locked_ids = await lock_batch(session)
-                
-                if not locked_ids:
-                    logger.info("No users available to lock. Sleeping for 60s...")
-                    await asyncio.sleep(60)
-                    continue
-                
-                # 2. Fetch User Details
-                users_to_process = await fetch_user_details(session)
-                
-                if not users_to_process:
-                    logger.warning("Locked batch but got no user details? Retrying in 10s...")
-                    await asyncio.sleep(10)
-                    continue
-                
-                # 3. Process Batch
-                batch_start_time = time.time()
-                batch_results = []
-                
-                # Process in chunks of 5 users at a time
-                chunk_size = 5
-                for i in range(0, len(users_to_process), chunk_size):
-                    chunk = users_to_process[i:i + chunk_size]
-                    tasks = [process_single_user(session, u, session_dir) for u in chunk]
-                    chunk_results = await asyncio.gather(*tasks)
-                    batch_results.extend(chunk_results)
-                
-                batch_elapsed = time.time() - batch_start_time
-                
-                # Create batch summary
-                batch_summary = []
-                for user_log in batch_results:
-                    if user_log:
-                        batch_summary.append({
-                            "user_id": user_log["user_id"],
-                            "final_decision": user_log["final_result"].get("final_decision"),
-                            "status_code": user_log["final_result"].get("status_code"),
-                            "rejection_reasons": user_log["final_result"].get("rejection_reasons", []),
-                            "extracted_data": user_log["final_result"].get("extracted_data", {}),
-                            "processing_time": user_log["timing"].get("total_time"),
-                            "errors": len(user_log["errors"])
-                        })
-                
-                # Save batch summary
-                save_batch_summary(session_dir, {
-                    "batch_elapsed_time": batch_elapsed,
-                    "users": batch_summary
-                })
-                
-                logger.info(f"--- Batch Complete. Processed {len(batch_results)} users in {batch_elapsed:.2f}s ---")
-                
-                # Optional sleep to be nice to the server
-                await asyncio.sleep(2)
+                # After processing all agents, take a short break before the next cycle
+                logger.info("--- Completed cycle for all agents. Starting next cycle in 5s... ---")
+                await asyncio.sleep(5)
                 
         except KeyboardInterrupt:
             logger.info("🛑 Shutdown requested...")
             raise
         finally:
-            # Save session summary before exiting
-            logger.info("💾 Saving final session summary...")
-            save_session_summary(session_dir)
-            logger.info(f"✅ All logs saved to: {session_dir}")
+            # Save session summaries for all agents before exiting
+            logger.info("💾 Saving final session summaries for all agents...")
+            for agent_id, session_dir in agent_sessions.items():
+                save_session_summary(session_dir)
+                logger.info(f"✅ Agent {agent_id} logs saved to: {session_dir}")
 
 if __name__ == "__main__":
-    print(f"🚀 Starting Production Dispatcher for Agent {AGENT_ID}")
+    print(f"🚀 Starting Production Dispatcher for Agents: {AGENT_IDS}")
+    print(f"📋 Will process agents in rotation continuously")
     try:
         asyncio.run(run_pipeline())
     except KeyboardInterrupt:
-        print("Stopping...")
+        print("\n🛑 Stopping...")

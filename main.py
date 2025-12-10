@@ -355,11 +355,14 @@ async def verify_user_production(req: VerifyRequest):
             "user_id": user_id,
             "final_decision": final_result['status'],
             "status_code": status_code,
+            "score": final_result['total_score'],
+            "breakdown": final_result['breakdown'],
             "extracted_data": {
                 "aadhaar": entity_data.get('aadharnumber'),
                 "dob": entity_data.get('dob'),
                 "gender": entity_data.get('gender')
-            }
+            },
+            "rejection_reasons": final_result['rejection_reasons']
         }
 
     except Exception as e:

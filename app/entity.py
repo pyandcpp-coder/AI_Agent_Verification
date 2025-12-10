@@ -425,11 +425,19 @@ class EntityAgent:
         aadhar_status = "aadhar_approved"
         if data.get('aadharnumber'):
             aad = data['aadharnumber']
-            aad_no_space = aad.replace(" ", "")
-            if re.search(r'X{4}', aad_no_space, re.IGNORECASE):
+            # Extract only digits, remove all spaces and special characters
+            aad_digits_only = re.sub(r'\D', '', aad)  # Remove all non-digit characters
+            
+            # Check for masked Aadhaar (with X's) in original text
+            if re.search(r'X{4}', aad, re.IGNORECASE):
                 aadhar_status = "aadhar_disapproved"
+            # Validate that we have exactly 12 digits
+            elif len(aad_digits_only) == 12:
+                data['aadharnumber'] = aad_digits_only
             else:
-                data['aadharnumber'] = aad_no_space
+                # If not exactly 12 digits, disapprove
+                aadhar_status = "aadhar_disapproved"
+                data['aadharnumber'] = aad_digits_only  # Store what we got anyway
         else:
             aadhar_status = "aadhar_disapproved"
         data['aadhar_status'] = aadhar_status
