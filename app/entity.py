@@ -542,39 +542,46 @@ class EntityAgent:
             aadhar_status = "aadhar_disapproved"
         data['aadhar_status'] = aadhar_status
         
-        # --- DOB Processing and Age Verification ---
+        # --- DOB Processing and Age Verification (Year-based only) ---
         age_status = "age_disapproved"
-        parsed_dob = None
+        birth_year = None
+        
         if data.get('dob'):
+            # Extract all digit groups from DOB text
             digit_groups = re.findall(r'\d+', data['dob'])
-            digits_only = ''.join(digit_groups)
-            if len(digits_only) == 8:
+            
+            # Look for a 4-digit year
+            year = next((g for g in digit_groups if len(g) == 4 and 1900 <= int(g) <= datetime.now().year), None)
+            
+            if year:
                 try:
-                    parsed_dob = datetime.strptime(digits_only, '%d%m%Y')
-                    data['dob'] = parsed_dob.strftime('%d-%m-%Y')
+                    birth_year = int(year)
+                    data['dob'] = str(birth_year)  # Store only the year
+                    
+                    # Calculate age based on year only
+                    current_year = datetime.now().year
+                    age = current_year - birth_year
+                    data['age'] = age
+                    
+                    # Approve if age >= 18
+                    if age >= 18:
+                        age_status = "age_approved"
+                        logger.info(f"Age approved: {age} years old (born in {birth_year})")
+                    else:
+                        logger.info(f"Age rejected: {age} years old (born in {birth_year})")
                 except ValueError:
                     data['dob'] = 'Invalid Format'
+                    data['age'] = None
+                    logger.warning(f"Could not parse year from DOB: {data.get('dob')}")
             else:
-                year = next((g for g in digit_groups if len(g) == 4), None)
-                if year:
-                    try:
-                        parsed_dob = datetime(int(year), 1, 1)
-                        data['dob'] = year
-                    except ValueError:
-                        data['dob'] = 'Invalid Format'
-                else:
-                    data['dob'] = 'Invalid Format'
-            
-            if parsed_dob:
-                today = datetime.now()
-                age = today.year - parsed_dob.year - ((today.month, today.day) < (parsed_dob.month, parsed_dob.day))
-                data['age'] = age
-                if age >= 18:
-                    age_status = "age_approved"
-            else:
+                data['dob'] = 'Invalid Format'
                 data['age'] = None
+                logger.warning(f"No valid 4-digit year found in DOB: {data.get('dob')}")
         else:
+            data['dob'] = 'Not Detected'
             data['age'] = None
+            logger.info("DOB not detected")
+        
         data['age_status'] = age_status
         
         # --- Gender normalization (Enhanced) ---
