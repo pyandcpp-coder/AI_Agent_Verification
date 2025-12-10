@@ -24,15 +24,31 @@ class FaceAgent:
         return faces[0].embedding
 
     def compare(self, img1_path, img2_path):
+        """
+        Compare two face images and return similarity score only.
+        Gender detection is handled by GenderPipeline.
+        
+        Returns:
+            dict: {
+                'score': float (0-100),
+                'source': 'face_agent'
+            }
+        """
         # Accepts LOCAL PATHS now
         emb1 = self.get_embedding(img1_path)
         emb2 = self.get_embedding(img2_path)
 
         if emb1 is None or emb2 is None:
-            return 0.0
+            return {
+                'score': 0.0,
+                'source': 'face_agent'
+            }
 
         similarity = np.dot(emb1, emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2))
         score = similarity * 100
         
-        return float(max(0, min(100, score)))
+        return {
+            'score': float(max(0, min(100, score))),
+            'source': 'face_agent'
+        }
     

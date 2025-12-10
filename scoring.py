@@ -119,26 +119,19 @@ class VerificationScorer:
                 critical_failure = True
                 rejection_reasons.append(f"Gender Mismatch (Input: {norm_input} vs OCR: {norm_extracted})")
         
-        # Case B: OCR is 'Other' or 'Not Detected' -> Use Face Analysis for Bonus
+        # Case B: OCR is 'Other' or 'Not Detected' -> Gender should come from entity_data (via gender_pipeline in main.py)
         else:
-            # Fallback to Gender detected from Face (by InsightFace in face_sim.py)
-            face_detected_gender = face_data.get("gender_img2") # Gender from Aadhaar Front image
-            norm_face_gender = clean_gender(face_detected_gender)
-            
-            if norm_input and norm_face_gender in ["male", "female"]:
-                if norm_input == norm_face_gender:
-                    # MATCH! Give 10 Bonus Points (instead of full 20)
-                    bonus_points = 10
-                    score += bonus_points
-                    breakdown["gender_bonus"] = bonus_points
-                else:
-                    # Mismatch on face gender too -> Reject
-                    critical_failure = True
-                    rejection_reasons.append(f"Gender Mismatch (Input: {norm_input} vs Face Analysis: {norm_face_gender})")
-            else:
-                # Could not determine gender from OCR or Face
+            # If OCR failed, the main.py should have already tried gender_pipeline
+            # and updated entity_data['gender'] with the fallback result
+            # So if we're here and gender is still 'Other', it means all methods failed
+            if norm_input:
+                # We have expected gender but couldn't verify it
                 critical_failure = True
-                rejection_reasons.append("Gender could not be verified (OCR & Face failed)")
+                rejection_reasons.append("Gender could not be verified from document (OCR failed)")
+            else:
+                # No expected gender provided, can't verify
+                # Don't fail, but give 0 points
+                pass
 
         score += gender_score
         breakdown["gender_score"] = gender_score

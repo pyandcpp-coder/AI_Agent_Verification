@@ -13,7 +13,7 @@ AGENT_IDS = [77, 78, 79, 80]  # List of agents to process in rotation
 BATCH_SIZE = 20
 TTL_HOURS = 12
 
-LOCAL_AI_URL = "http://localhost:8100/verification/verify/agent/"
+LOCAL_AI_URL = "http://localhost:8000/verification/verify/agent/"
 
 LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(exist_ok=True)
