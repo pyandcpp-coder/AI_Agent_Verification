@@ -65,7 +65,7 @@ class EntityAgent:
              logger.critical(f"An error occurred while checking Tesseract: {e}")
              raise RuntimeError(f"Error checking Tesseract: {e}")
 
-    def extract_from_file(self, file_path: str, crop_coords: List[int] = None, confidence_threshold: float = 0.15, card_side: str = 'front'):
+    def extract_from_file(self, file_path: str, crop_coords: List[int] = None, confidence_threshold: float = 0.15):
         """
         Main Entry Point for the Orchestrator.
         1. Reads the file from 'file_path'.
@@ -90,8 +90,8 @@ class EntityAgent:
                 logger.info(f"Cropping image to: {crop_coords}")
                 img = img[y1:y2, x1:x2]
 
-            # 3. Detect Entities (Pass the numpy array directly with card_side)
-            all_detections = self.detect_entities_in_image(img, confidence_threshold, card_side)
+            # 3. Detect Entities (Pass the numpy array directly)
+            all_detections = self.detect_entities_in_image(img, confidence_threshold)
             
             if not all_detections:
                 return {"success": False, "message": "no_entities_detected"}
@@ -115,11 +115,11 @@ class EntityAgent:
             logger.error(f"Error in extraction: {e}\n{traceback.format_exc()}")
             return {"success": False, "error": str(e)}
 
-    def detect_entities_in_image(self, image_input, confidence_threshold: float, card_side: str = 'front'):
+    def detect_entities_in_image(self, image_input, confidence_threshold: float):
         """
-        Modified to accept card_side parameter and filter entities accordingly.
+        Modified slightly to accept either a Path (str) or a Numpy Array (cropped image).
         """
-        logger.info(f"\nStep 1: Detecting entities in image (Side: {card_side}, Threshold: {confidence_threshold})")
+        logger.info(f"\nStep 1: Detecting entities in image (Threshold: {confidence_threshold})")
         
         # Handle input type
         if isinstance(image_input, str):
@@ -134,16 +134,8 @@ class EntityAgent:
         if img is None:
             return {}
         
-        # Define entities based on card side
-        if card_side.lower() == 'front':
-            target_entities = {'aadharnumber', 'dob', 'gender', 'name', 'name_otherlang'}
-        elif card_side.lower() == 'back':
-            target_entities = {'aadharnumber', 'address', 'address_other_lang', 'pincode', 'mobile_no', 'city'}
-        else:
-            # Default to basic entities if side not specified
-            target_entities = {'aadharnumber', 'dob', 'gender'}
-        
-        logger.info(f"  Target entities for {card_side}: {target_entities}")
+        # Only process these 3 entity types
+        target_entities = {'aadharnumber', 'dob', 'gender'}
         
         # Run entity detection
         results = self.model2(img, device=self.device, verbose=False)
@@ -174,7 +166,7 @@ class EntityAgent:
         all_detections = {
             input_name: {
                 "card_image": img,
-                "card_type": card_side,
+                "card_type": "front",
                 "detections": card_detections
             }
         }
@@ -182,145 +174,27 @@ class EntityAgent:
         return all_detections
 
     def crop_entities(self, all_detections: Dict[str, Dict[str, Any]]):
-        """Step 3: Crop individual entities with bounds checking"""
+        """Step 3: Crop individual entities"""
         logger.info(f"\nStep 3: Cropping individual entities")
         for card_name, card_data in all_detections.items():
             img = card_data['card_image']
-            h, w = img.shape[:2]
-            
             for i, detection in enumerate(card_data['detections']):
                 x1, y1, x2, y2 = detection['bbox']
-                
-                # Sanitize bounds
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(w, x2), min(h, y2)
-                
-                if x2 <= x1 or y2 <= y1:
-                    logger.warning(f"  Invalid bbox for {detection['class_name']}, skipping")
-                    detection['cropped_image'] = None
-                    continue
-                
                 crop = img[y1:y2, x1:x2]
                 detection['cropped_image'] = crop
                 entity_key = f"{card_name}_{detection['class_name']}_{i}"
                 detection['entity_key'] = entity_key
         return all_detections
     
-    def _preprocess_for_aadhaar_ocr(self, img: np.ndarray) -> np.ndarray:
+    def _correct_entity_orientation_and_preprocess(self, entity_image: np.ndarray, entity_key: str, osd_confidence_threshold: float = 0.5) -> Optional[Any]:
         """
-        Specialized preprocessing for Aadhaar numbers which are often in specific fonts/formats.
-        """
-        try:
-            # Convert to grayscale if needed
-            if len(img.shape) == 3:
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            else:
-                gray = img.copy()
-            
-            # Resize if too small (Aadhaar numbers need good resolution)
-            h, w = gray.shape
-            if h < 50:
-                scale = 50 / h
-                new_w, new_h = int(w * scale), int(h * scale)
-                gray = cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
-            
-            # Try multiple preprocessing approaches and pick best
-            preprocessed_versions = []
-            
-            # Version 1: Simple threshold
-            _, thresh1 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            preprocessed_versions.append(('otsu', thresh1))
-            
-            # Version 2: Adaptive threshold
-            thresh2 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                           cv2.THRESH_BINARY, 11, 2)
-            preprocessed_versions.append(('adaptive', thresh2))
-            
-            # Version 3: Enhanced contrast + threshold
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-            enhanced = clahe.apply(gray)
-            _, thresh3 = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            preprocessed_versions.append(('clahe', thresh3))
-            
-            # Version 4: Denoising + threshold
-            denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
-            _, thresh4 = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            preprocessed_versions.append(('denoised', thresh4))
-            
-            return preprocessed_versions
-            
-        except Exception as e:
-            logger.warning(f"  Error in Aadhaar preprocessing: {e}")
-            return [('original', img)]
-    
-    def _extract_aadhaar_with_multiple_methods(self, img: np.ndarray) -> str:
-        """
-        Try multiple OCR methods specifically for Aadhaar numbers.
-        """
-        try:
-            preprocessed_versions = self._preprocess_for_aadhaar_ocr(img)
-            
-            # Try different PSM modes and configurations
-            configs = [
-                '--psm 7 -c tessedit_char_whitelist=0123456789',  # Single line, digits only
-                '--psm 8 -c tessedit_char_whitelist=0123456789',  # Single word, digits only
-                '--psm 6 -c tessedit_char_whitelist=0123456789',  # Block of text, digits only
-                '--psm 7',  # Single line, all chars
-                '--psm 13',  # Raw line
-            ]
-            
-            best_result = ""
-            best_digit_count = 0
-            
-            for method_name, processed_img in preprocessed_versions:
-                for config in configs:
-                    try:
-                        from PIL import Image
-                        pil_img = Image.fromarray(processed_img)
-                        text = pytesseract.image_to_string(pil_img, lang='eng', config=config)
-                        
-                        # Extract digits only
-                        digits = re.sub(r'\D', '', text)
-                        
-                        logger.debug(f"    Method: {method_name}, Config: {config[:20]}, Result: {digits}")
-                        
-                        # Keep track of best result (most digits found)
-                        if len(digits) > best_digit_count:
-                            best_digit_count = len(digits)
-                            best_result = digits
-                            logger.info(f"    Better result found: {digits} (method: {method_name})")
-                        
-                        # If we got 12 digits, we're done!
-                        if len(digits) == 12:
-                            logger.info(f"    Perfect Aadhaar found: {digits}")
-                            return digits
-                            
-                    except Exception as e:
-                        logger.debug(f"    OCR attempt failed: {e}")
-                        continue
-            
-            logger.info(f"    Best Aadhaar result: {best_result} ({best_digit_count} digits)")
-            return best_result
-            
-        except Exception as e:
-            logger.error(f"  Error in Aadhaar extraction: {e}")
-            return ""
-    
-    def _correct_entity_orientation_and_preprocess(self, entity_image: np.ndarray, entity_key: str, class_name: str = None, osd_confidence_threshold: float = 0.5) -> Optional[Any]:
-        """
-        Enhanced preprocessing with special handling for Aadhaar numbers.
+        Enhanced preprocessing and orientation correction with improved logging and error handling.
         """
         try:
             img = entity_image
             if img is None or img.size == 0:
                 logger.warning(f"  Entity image data for {entity_key} is empty, skipping.")
                 return None
-            
-            # Special handling for Aadhaar numbers - skip complex orientation detection
-            if class_name == 'aadharnumber':
-                logger.info(f"  Using specialized Aadhaar preprocessing for {entity_key}")
-                # Return original image for specialized Aadhaar processing
-                return img
             
             h, w = img.shape[:2]
             if h < 100:
@@ -341,7 +215,7 @@ class EntityAgent:
                     else:
                         best_rotation = 0
                 except pytesseract.TesseractError as e:
-                    logger.warning(f" OSD failed for {entity_key}. Assuming 0° rotation.")
+                    logger.warning(f" Both letter-based and OSD failed for {entity_key}. Assuming 0° rotation. Details: {e}")
                     best_rotation = 0
             
             corrected_img = img
@@ -525,7 +399,8 @@ class EntityAgent:
 
     def perform_multi_language_ocr(self, all_detections: Dict[str, Dict[str, Any]]):
         """
-        Step 4: Correcting orientation and perform OCR with specialized handling for Aadhaar.
+        Step 4: Correcting orientation and perform OCR on in-memory entity images.
+        Uses English for standard fields and other languages for '_other_lang' fields.
         """
         logger.info(f"\nStep 4: Correcting Entity Orientation & Performing Multi-Language OCR")
         ocr_results = {}
@@ -539,21 +414,9 @@ class EntityAgent:
                     continue
 
                 logger.info(f"  Processing entity: {entity_key} (Class: {class_name})")
-                
-                # Special handling for Aadhaar numbers
-                if class_name == 'aadharnumber':
-                    extracted_text = self._extract_aadhaar_with_multiple_methods(cropped_image)
-                    ocr_results[entity_key] = extracted_text
-                    if extracted_text:
-                        logger.info(f"    Aadhaar OCR Result: {extracted_text}")
-                    else:
-                        logger.warning(f"    Aadhaar OCR failed to extract number")
-                    continue
-                
-                # Regular processing for other entities
                 lang_to_use = self.other_lang_code if class_name and class_name.endswith('_other_lang') else 'eng'
                 
-                processed_pil_img = self._correct_entity_orientation_and_preprocess(cropped_image, entity_key, class_name)
+                processed_pil_img = self._correct_entity_orientation_and_preprocess(cropped_image, entity_key)
 
                 if processed_pil_img:
                     try:
@@ -749,6 +612,7 @@ class EntityAgent:
 if __name__ == "__main__":
     try:
         agent = EntityAgent(model_path="models/best.pt")
-        print("✓ Entity Agent initialized successfully")
+        print(" Entity Agent initialized successfully ")
     except Exception as e:
-        print(f"✗ Initialization failed: {e}")
+        print(f"Initialization failed: {e}")
+
