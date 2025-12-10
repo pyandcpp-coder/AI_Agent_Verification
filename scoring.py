@@ -30,16 +30,17 @@ class VerificationScorer:
 
         # --- 1. Face Similarity (0 - 40 points) ---
         face_sim = face_data.get("score", 0)
+        low_face_sim = False
         
-        if face_sim < 15:
-            # Critical: Face match below 15% -> Auto Reject
+        if face_sim < 16:
+            # Low face similarity - Flag it but don't auto-reject yet
             breakdown["face_score"] = 0
-            critical_failure = True
-            rejection_reasons.append(f"Face Not Matching (Similarity: {face_sim:.2f}%)")
+            low_face_sim = True
+            rejection_reasons.append(f"Low Face Similarity (Similarity: {face_sim:.2f}%)")
         else:
-            # Between 15% and 100% -> Scale linearly to 0-40 points
-            # Formula: ((Score - 15) / 85) * 40, where 85 is the range (100-15)
-            face_points = ((face_sim - 15) / 85) * 40
+            # Between 16% and 100% -> Scale linearly to 0-40 points
+            # Formula: ((Score - 16) / 84) * 40, where 84 is the range (100-16)
+            face_points = ((face_sim - 16) / 84) * 40
             score += face_points
             breakdown["face_score"] = round(face_points, 2)
 
@@ -145,6 +146,9 @@ class VerificationScorer:
         # --- FINAL DECISION ---
         if critical_failure:
             status = "REJECTED"
+        elif low_face_sim and score >= 60:
+            # Low face similarity but high overall score -> REVIEW
+            status = "REVIEW"
         elif score >= 65:
             status = "APPROVED"
         elif 40 <= score < 65:

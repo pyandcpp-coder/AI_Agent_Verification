@@ -464,14 +464,61 @@ class EntityAgent:
         """Your EXACT original Validation Logic (Moved inside class)"""
         fields = ['aadharnumber', 'dob', 'gender']
         data = {key: "" for key in fields}
+        
+        # Special handling for Aadhar number to check both front and back
+        aadhar_front = ""
+        aadhar_back = ""
+        
         for side in ['front', 'back']:
             for card in organized_results.get(side, {}).values():
                 for field in fields:
                     if field in card['entities'] and card['entities'][field]:
                         all_texts = [item.get('extracted_text', '') for item in card['entities'][field]]
                         first_valid_text = next((text for text in all_texts if text), '')
+                        
                         if first_valid_text:
-                            data[field] = first_valid_text
+                            if field == 'aadharnumber':
+                                if side == 'front':
+                                    aadhar_front = first_valid_text
+                                elif side == 'back':
+                                    aadhar_back = first_valid_text
+                            else:
+                                data[field] = first_valid_text
+        
+        # --- Special Logic for Aadhar Number from Front & Back ---
+        best_aadhar = ""
+        aadhar_front_digits = re.sub(r'\D', '', aadhar_front) if aadhar_front else ""
+        aadhar_back_digits = re.sub(r'\D', '', aadhar_back) if aadhar_back else ""
+        
+        logger.info(f"Aadhar Front: '{aadhar_front}' -> Digits: '{aadhar_front_digits}'")
+        logger.info(f"Aadhar Back: '{aadhar_back}' -> Digits: '{aadhar_back_digits}'")
+        
+        if aadhar_front_digits == aadhar_back_digits and aadhar_front_digits:
+            # Both match - use this
+            logger.info(f"Aadhar match between front and back: {aadhar_front_digits}")
+            best_aadhar = aadhar_front_digits
+        else:
+            # Different values - prefer the one with all 12 digits, or the one with more digits
+            if len(aadhar_front_digits) == 12:
+                logger.info(f"Using Aadhar from front (complete 12 digits): {aadhar_front_digits}")
+                best_aadhar = aadhar_front_digits
+            elif len(aadhar_back_digits) == 12:
+                logger.info(f"Using Aadhar from back (complete 12 digits): {aadhar_back_digits}")
+                best_aadhar = aadhar_back_digits
+            elif len(aadhar_front_digits) > len(aadhar_back_digits):
+                logger.info(f"Using Aadhar from front (more digits): {aadhar_front_digits}")
+                best_aadhar = aadhar_front_digits
+            elif len(aadhar_back_digits) > len(aadhar_front_digits):
+                logger.info(f"Using Aadhar from back (more digits): {aadhar_back_digits}")
+                best_aadhar = aadhar_back_digits
+            elif aadhar_front_digits:
+                logger.info(f"Using Aadhar from front (fallback): {aadhar_front_digits}")
+                best_aadhar = aadhar_front_digits
+            elif aadhar_back_digits:
+                logger.info(f"Using Aadhar from back (fallback): {aadhar_back_digits}")
+                best_aadhar = aadhar_back_digits
+        
+        data['aadharnumber'] = best_aadhar
         
         # --- Aadhaar Number Validation ---
         aadhar_status = "aadhar_approved"
@@ -481,7 +528,8 @@ class EntityAgent:
             aad_digits_only = re.sub(r'\D', '', aad)  # Remove all non-digit characters
             
             # Check for masked Aadhaar (with X's) in original text
-            if re.search(r'X{4}', aad, re.IGNORECASE):
+            if (aadhar_front and re.search(r'X{4}', aadhar_front, re.IGNORECASE)) or \
+               (aadhar_back and re.search(r'X{4}', aadhar_back, re.IGNORECASE)):
                 aadhar_status = "aadhar_disapproved"
             # Validate that we have exactly 12 digits
             elif len(aad_digits_only) == 12:
