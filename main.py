@@ -1,4 +1,5 @@
 import os
+import sys
 import shutil
 import asyncio
 import aiohttp
@@ -8,6 +9,11 @@ from pydantic import BaseModel, Field
 from pathlib import Path
 from typing import Optional, Union
 
+# Ensure the current directory is in the Python path
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
+
 # --- IMPORT ACTUAL AGENTS ---
 try:
     from app.face_sim import FaceAgent
@@ -15,13 +21,11 @@ try:
     from app.entity import EntityAgent
     from app.gender_pipeline import GenderPipeline
     from scoring import VerificationScorer
-except ImportError:
-    # Fallback for flat directory structures
-    from face_sim import FaceAgent
-    from fb_detect import DocAgent
-    from entity import EntityAgent
-    from gender_pipeline import GenderPipeline
-    from scoring import VerificationScorer
+except ImportError as e:
+    print(f"ImportError: {e}")
+    print(f"Current directory: {current_dir}")
+    print(f"sys.path: {sys.path}")
+    raise
 
 app = FastAPI()
 
