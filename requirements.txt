@@ -19,3 +19,4 @@ requests
 transformers
 brotlipy
 requests
+cloudscraper

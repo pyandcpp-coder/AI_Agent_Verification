@@ -4,6 +4,7 @@ import shutil
 import asyncio
 import aiohttp
 import aiofiles
+import cloudscraper
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from pathlib import Path
@@ -66,31 +67,37 @@ class VerifyRequest(BaseModel):
 async def fetch_file(session: aiohttp.ClientSession, source: str, destination: Path) -> bool:
     """
     Hybrid Fetcher:
-    - If source is http/https -> Downloads it.
+    - If source is http/https -> Downloads it using cloudscraper (bypasses Cloudflare).
     - If source is a local path -> Copies it.
     """
     try:
         if str(source).startswith(('http://', 'https://')):
-            # Add browser-like headers to avoid Cloudflare blocking
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Connection': 'keep-alive',
-                'Sec-Fetch-Dest': 'image',
-                'Sec-Fetch-Mode': 'no-cors',
-                'Sec-Fetch-Site': 'cross-site',
-                'Cache-Control': 'no-cache',
-                'Pragma': 'no-cache'
-            }
-            async with session.get(str(source), headers=headers, timeout=15) as resp:
-                if resp.status == 200:
-                    async with aiofiles.open(destination, 'wb') as f:
-                        await f.write(await resp.read())
-                    return True
-                else:
-                    print(f"Failed to download URL: {source} (Status: {resp.status})")
+            # Use cloudscraper in a thread executor to bypass Cloudflare
+            # cloudscraper handles JS challenges, TLS fingerprinting, and cookies automatically
+            loop = asyncio.get_event_loop()
+            
+            def download_with_cloudscraper(url: str) -> bytes:
+                scraper = cloudscraper.create_scraper(
+                    browser={
+                        'browser': 'chrome',
+                        'platform': 'darwin',  # macOS
+                        'mobile': False
+                    }
+                )
+                response = scraper.get(url, timeout=30)
+                response.raise_for_status()
+                return response.content
+            
+            # Run the blocking cloudscraper call in executor
+            content = await loop.run_in_executor(None, download_with_cloudscraper, str(source))
+            
+            # Write content to file
+            async with aiofiles.open(destination, 'wb') as f:
+                await f.write(content)
+            
+            print(f"Successfully downloaded: {source} ({len(content)} bytes)")
+            return True
+            
         else:
             # Assume local path (e.g., "uploads/38070/...")
             # We resolve it relative to the current working directory
@@ -102,6 +109,8 @@ async def fetch_file(session: aiohttp.ClientSession, source: str, destination: P
                 print(f"Local file not found: {source}")
     except Exception as e:
         print(f"Error fetching {source}: {e}")
+        import traceback
+        traceback.print_exc()
     return False
 
 async def setup_files(user_id: str, req: VerifyRequest):
