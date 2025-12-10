@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class EntityAgent:
-    def __init__(self, model_path="models/best.pt"):
+    def __init__(self, model_path="models/best.pt", other_lang_code='hin+tel+ben'):
 
         if torch.cuda.is_available():
             self.device = "cuda"
@@ -43,10 +43,11 @@ class EntityAgent:
         logger.info("Loading entity detection model from filesystem...")
         self.model2 = YOLO(self.entity_model_path)
         
-        # self.other_lang_code = other_lang_code
+        self.other_lang_code = other_lang_code
         self._check_tesseract()
 
         logger.info("YOLOv8 entity detection model loaded successfully.")
+        logger.info(f"EntityAgent initialized to use '{self.other_lang_code}' for other language fields.")
         
         self.entity_classes = {
             0: 'aadharnumber', 1: 'address', 2: 'address_other_lang', 3: 'city',
@@ -187,7 +188,7 @@ class EntityAgent:
     
     def _correct_entity_orientation_and_preprocess(self, entity_image: np.ndarray, entity_key: str, osd_confidence_threshold: float = 0.5) -> Optional[Any]:
         """
-        Your EXACT original preprocessing and orientation logic.
+        Enhanced preprocessing and orientation correction with improved logging and error handling.
         """
         try:
             img = entity_image
@@ -210,13 +211,16 @@ class EntityAgent:
                     osd = pytesseract.image_to_osd(img_for_analysis, output_type=pytesseract.Output.DICT)
                     if osd['orientation_conf'] > osd_confidence_threshold:
                         best_rotation = osd['rotate']
+                        logger.info(f" Using Tesseract OSD for {entity_key}: {best_rotation}° (conf: {osd['orientation_conf']:.2f})")
                     else:
                         best_rotation = 0
-                except pytesseract.TesseractError:
+                except pytesseract.TesseractError as e:
+                    logger.warning(f" Both letter-based and OSD failed for {entity_key}. Assuming 0° rotation. Details: {e}")
                     best_rotation = 0
             
             corrected_img = img
             if best_rotation != 0:
+                logger.info(f"   Correcting entity {entity_key} orientation by {best_rotation}°")
                 if best_rotation == 90: 
                     corrected_img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
                 elif best_rotation == 180: 
@@ -226,45 +230,63 @@ class EntityAgent:
 
             h_corr, w_corr = corrected_img.shape[:2]
             if h_corr > w_corr and 'address' not in entity_key:
+                logger.info(f"   Rotating vertical entity {entity_key} to horizontal format")
                 corrected_img = cv2.rotate(corrected_img, cv2.ROTATE_90_CLOCKWISE)
 
             from PIL import Image
             return Image.fromarray(cv2.cvtColor(corrected_img, cv2.COLOR_BGR2GRAY))
             
         except Exception as e:
-            logger.error(f"Preprocessing error for {entity_key}: {e}")
+            logger.error(f"   Unhandled error during entity orientation/preprocessing for {entity_key}: {e}")
             return None
 
     def _detect_orientation_by_letters(self, img: np.ndarray, entity_key: str) -> Optional[int]:
-        """Your EXACT original letter orientation logic"""
+        """
+        Detect the correct orientation by analyzing letter shapes and OCR confidence
+        at different rotation angles.
+        """
         try:
             rotations = [0, 90, 180, 270]
             rotation_scores = {}
             
             for rotation in rotations:
-                if rotation == 0: rotated_img = img
-                elif rotation == 90: rotated_img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                elif rotation == 180: rotated_img = cv2.rotate(img, cv2.ROTATE_180)
-                elif rotation == 270: rotated_img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+                if rotation == 0:
+                    rotated_img = img
+                elif rotation == 90:
+                    rotated_img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                elif rotation == 180:
+                    rotated_img = cv2.rotate(img, cv2.ROTATE_180)
+                elif rotation == 270:
+                    rotated_img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
                 
                 score = self._calculate_orientation_score(rotated_img, rotation)
                 rotation_scores[rotation] = score
+                logger.debug(f"      Rotation {rotation}°: score = {score:.3f}")
             
             best_rotation = max(rotation_scores.keys(), key=lambda k: rotation_scores[k])
             best_score = rotation_scores[best_rotation]
             
             if best_score > 0.1:
+                logger.info(f" Letter-based analysis for {entity_key}: {best_rotation}° (score: {best_score:.3f})")
                 return best_rotation
             else:
+                logger.warning(f"   Letter-based analysis inconclusive for {entity_key} (best score: {best_score:.3f})")
                 return None
-        except Exception:
+                
+        except Exception as e:
+            logger.warning(f"  Error in letter-based orientation detection for {entity_key}: {e}")
             return None
 
     def _calculate_orientation_score(self, img: np.ndarray, rotation: int) -> float:
-        """Your EXACT original scoring logic"""
+        """
+        Calculate a comprehensive score for how likely this orientation is correct.
+        Combines OCR confidence, letter shapes, and text line analysis.
+        """
         try:
-            if len(img.shape) == 3: gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            else: gray = img
+            if len(img.shape) == 3:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = img
                 
             ocr_score = self._get_ocr_confidence_score(gray)
             shape_score = self._analyze_letter_shapes(gray)
@@ -272,13 +294,18 @@ class EntityAgent:
             
             total_score = (ocr_score * 0.5 + shape_score * 0.3 + line_score * 0.2)
             return total_score
-        except Exception:
+            
+        except Exception as e:
+            logger.debug(f"      Error calculating orientation score: {e}")
             return 0.0
 
     def _get_ocr_confidence_score(self, gray_img: np.ndarray) -> float:
-        """Your EXACT original OCR confidence logic"""
+        """
+        Get OCR confidence and text quality score by trying multiple PSM modes.
+        Returns a normalized score between 0 and 1.
+        """
         try:
-            psm_modes = [6, 7, 8, 13]  # KEPT ORIGINAL MODES
+            psm_modes = [6, 7, 8, 13]
             best_confidence = 0.0
             best_text_length = 0
             
@@ -293,44 +320,61 @@ class EntityAgent:
                         if avg_confidence > best_confidence or (avg_confidence == best_confidence and text_length > best_text_length):
                             best_confidence = avg_confidence
                             best_text_length = text_length
+                            
                 except pytesseract.TesseractError:
                     continue
             
             confidence_factor = best_confidence / 100.0
             length_factor = min(best_text_length / 10.0, 1.0)
             return confidence_factor * 0.7 + length_factor * 0.3
+            
         except Exception:
             return 0.0
 
     def _analyze_letter_shapes(self, gray_img: np.ndarray) -> float:
-        """Your EXACT original shape logic"""
+        """
+        Analyze the shapes of detected contours to determine if they look like upright letters.
+        Returns a normalized score between 0 and 1.
+        """
         try:
             _, binary = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
             contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours: return 0.0
+            if not contours:
+                return 0.0
             
             upright_score = 0.0
             valid_contours = 0
             for contour in contours:
                 area = cv2.contourArea(contour)
-                if area < 20: continue
+                if area < 20:
+                    continue
                 x, y, w, h = cv2.boundingRect(contour)
-                if w < 5 or h < 5 or w > gray_img.shape[1] * 0.8 or h > gray_img.shape[0] * 0.8: continue
+                if w < 5 or h < 5 or w > gray_img.shape[1] * 0.8 or h > gray_img.shape[0] * 0.8:
+                    continue
                 
                 aspect_ratio = h / w
                 if 0.3 <= aspect_ratio <= 4.0:
                     valid_contours += 1
-                    if 1.0 <= aspect_ratio <= 2.5: upright_score += 1.0
-                    elif 0.5 <= aspect_ratio <= 3.5: upright_score += 0.7
-                    else: upright_score += 0.3
+                    if 1.0 <= aspect_ratio <= 2.5:
+                        upright_score += 1.0
+                    elif 0.5 <= aspect_ratio <= 3.5:
+                        upright_score += 0.7
+                    else:
+                        upright_score += 0.3
             
-            if valid_contours == 0: return 0.0
+            if valid_contours == 0:
+                return 0.0
             return min(upright_score / valid_contours, 1.0)
+            
         except Exception:
             return 0.0
 
     def _analyze_text_lines(self, gray_img: np.ndarray) -> float:
-        """Your EXACT original line logic"""
+        """
+        Analyze text line orientation using morphological operations.
+        Horizontal text should have more horizontal lines than vertical lines.
+        Returns a normalized score between 0 and 1.
+        """
         try:
             _, binary = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
             
@@ -344,15 +388,20 @@ class EntityAgent:
             vertical_pixels = cv2.countNonZero(vertical_lines)
             
             total_pixels = horizontal_pixels + vertical_pixels
-            if total_pixels == 0: return 0.5
+            if total_pixels == 0:
+                return 0.5
             
             horizontal_ratio = horizontal_pixels / total_pixels
             return horizontal_ratio
+            
         except Exception:
             return 0.5
 
     def perform_multi_language_ocr(self, all_detections: Dict[str, Dict[str, Any]]):
-        """Your EXACT original OCR execution logic"""
+        """
+        Step 4: Correcting orientation and perform OCR on in-memory entity images.
+        Uses English for standard fields and other languages for '_other_lang' fields.
+        """
         logger.info(f"\nStep 4: Correcting Entity Orientation & Performing Multi-Language OCR")
         ocr_results = {}
         for card_name, card_data in all_detections.items():
@@ -361,8 +410,10 @@ class EntityAgent:
                 entity_key = detection.get('entity_key')
                 class_name = detection.get('class_name')
 
-                if cropped_image is None or entity_key is None: continue
+                if cropped_image is None or entity_key is None:
+                    continue
 
+                logger.info(f"  Processing entity: {entity_key} (Class: {class_name})")
                 lang_to_use = self.other_lang_code if class_name and class_name.endswith('_other_lang') else 'eng'
                 
                 processed_pil_img = self._correct_entity_orientation_and_preprocess(cropped_image, entity_key)
@@ -372,6 +423,7 @@ class EntityAgent:
                         text = pytesseract.image_to_string(processed_pil_img, lang=lang_to_use, config='--psm 6')
                         extracted_text = ' '.join(text.split()).strip()
                         ocr_results[entity_key] = extracted_text
+                        logger.info(f"    OCR Result: {extracted_text[:50]}..." if len(extracted_text) > 50 else f"    OCR Result: {extracted_text}")
                     except Exception as e:
                         logger.error(f" OCR failed for {entity_key}: {e}")
                         ocr_results[entity_key] = None
@@ -477,12 +529,27 @@ class EntityAgent:
             data['age'] = None
         data['age_status'] = age_status
         
-        # --- Gender normalization ---
+        # --- Gender normalization (Enhanced) ---
         if data['gender']:
             gender = data['gender'].strip().lower()
-            if gender == 'male': data['gender'] = 'Male'
-            elif gender == 'female': data['gender'] = 'Female'
-            else: data['gender'] = 'Other'
+            # Remove special characters and extra spaces
+            gender = re.sub(r'[^a-z]', '', gender)
+            
+            # Check for male variations
+            if 'male' in gender and 'female' not in gender:
+                data['gender'] = 'Male'
+            # Check for female variations
+            elif 'female' in gender or 'femal' in gender:
+                data['gender'] = 'Female'
+            # Check for other common variations
+            elif gender in ['m', 'man', 'boy']:
+                data['gender'] = 'Male'
+            elif gender in ['f', 'woman', 'girl', 'femlae', 'femaie']:
+                data['gender'] = 'Female'
+            else:
+                data['gender'] = 'Other'
+        else:
+            data['gender'] = 'Not Detected'
             
         return data
 

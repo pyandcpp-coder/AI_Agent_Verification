@@ -16,3 +16,6 @@ LOGGING_GUIDE.md
 agent_log.txt
 logs/
 MULTI_AGENT_README.md
+OCR_ENHANCEMENTS.md
+simple_extractor.py
+testing/
