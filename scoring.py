@@ -142,9 +142,9 @@ class VerificationScorer:
         elif low_face_sim and score >= 60:
             # Low face similarity but high overall score -> REVIEW
             status = "REVIEW"
-        elif score >= 65:
+        elif score > 61:
             status = "APPROVED"
-        elif 40 <= score < 65:
+        elif 40 <= score <= 61:
             status = "REVIEW"
         else:
             status = "REJECTED"

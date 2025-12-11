@@ -37,10 +37,10 @@ class EntityAgent:
         self.save_debug_images = save_debug_images
         
         # Create debug output directories
-        if self.save_debug_images:
-            self.debug_base_dir = Path("debug_output")
-            self.debug_base_dir.mkdir(exist_ok=True)
-            logger.info(f"Debug images will be saved to: {self.debug_base_dir}")
+        # if self.save_debug_images:
+        #     self.debug_base_dir = Path("debug_output")
+        #     self.debug_base_dir.mkdir(exist_ok=True)
+        #     logger.info(f"Debug images will be saved to: {self.debug_base_dir}")
         
         logger.info("Checking for entity detection YOLO model on filesystem...")
         if not Path(self.entity_model_path).exists():
@@ -155,8 +155,8 @@ class EntityAgent:
         logger.info(f"✓ Best card rotation: {best_rotation}° (score: {best_score:.3f})")
         
         # Save visualization if debug enabled
-        if self.save_debug_images and session_dir:
-            self._save_rotation_comparison(img, rotation_details, best_rotation, session_dir)
+        # if self.save_debug_images and session_dir:
+        #     self._save_rotation_comparison(img, rotation_details, best_rotation, session_dir)
         
         return best_rotation
 
@@ -210,9 +210,9 @@ class EntityAgent:
             bottom_row = np.hstack([comparisons[2], comparisons[3]])
             grid = np.vstack([top_row, bottom_row])
             
-            rotation_path = session_dir / "00_card_rotation_detection.jpg"
-            cv2.imwrite(str(rotation_path), grid)
-            logger.info(f"  Saved rotation comparison: {rotation_path}")
+            # rotation_path = session_dir / "00_card_rotation_detection.jpg"
+            # cv2.imwrite(str(rotation_path), grid)
+            # logger.info(f"  Saved rotation comparison: {rotation_path}")
             
         except Exception as e:
             logger.warning(f"  Could not save rotation comparison: {e}")
@@ -295,10 +295,10 @@ class EntityAgent:
             # Create session-specific debug directory
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             session_dir = None
-            if self.save_debug_images:
-                session_dir = self.debug_base_dir / f"session_{timestamp}_{card_side}"
-                session_dir.mkdir(exist_ok=True)
-                logger.info(f"Session debug directory: {session_dir}")
+            # if self.save_debug_images:
+            #     session_dir = self.debug_base_dir / f"session_{timestamp}_{card_side}"
+            #     session_dir.mkdir(exist_ok=True)
+            #     logger.info(f"Session debug directory: {session_dir}")
             
             # 1. Read ORIGINAL Image
             original_img = cv2.imread(file_path)
@@ -320,10 +320,10 @@ class EntityAgent:
                     original_img = cv2.rotate(original_img, cv2.ROTATE_90_CLOCKWISE)
                 
                 # Save rotated image
-                if self.save_debug_images and session_dir:
-                    rotated_path = session_dir / f"00a_rotated_{card_rotation}deg.jpg"
-                    cv2.imwrite(str(rotated_path), original_img)
-                    logger.info(f"  Saved rotated image: {rotated_path}")
+                # if self.save_debug_images and session_dir:
+                #     rotated_path = session_dir / f"00a_rotated_{card_rotation}deg.jpg"
+                #     cv2.imwrite(str(rotated_path), original_img)
+                #     logger.info(f"  Saved rotated image: {rotated_path}")
 
             # === ATTEMPT 1: Try with Crop Coordinates ===
             logger.info("=" * 60)
@@ -354,19 +354,19 @@ class EntityAgent:
                 logger.info(f"Cropping image to: [{x1}, {y1}, {x2}, {y2}] (after rotation adjustment)")
                 
                 # Save visualization of crop region
-                if self.save_debug_images and session_dir:
-                    img_with_crop_box = img.copy()
-                    cv2.rectangle(img_with_crop_box, (x1, y1), (x2, y2), (255, 0, 0), 3)
-                    cv2.putText(img_with_crop_box, f"Crop Region: {card_side}", (x1, y1-10),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-                    crop_box_path = session_dir / f"00b_crop_region_{card_side}.jpg"
-                    cv2.imwrite(str(crop_box_path), img_with_crop_box)
+                # if self.save_debug_images and session_dir:
+                #     img_with_crop_box = img.copy()
+                #     cv2.rectangle(img_with_crop_box, (x1, y1), (x2, y2), (255, 0, 0), 3)
+                #     cv2.putText(img_with_crop_box, f"Crop Region: {card_side}", (x1, y1-10),
+                #                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+                #     crop_box_path = session_dir / f"00b_crop_region_{card_side}.jpg"
+                #     cv2.imwrite(str(crop_box_path), img_with_crop_box)
                 
                 img = img[y1:y2, x1:x2]
                 
-                if self.save_debug_images and session_dir:
-                    input_path = session_dir / f"00c_cropped_input_{card_side}.jpg"
-                    cv2.imwrite(str(input_path), img)
+                # if self.save_debug_images and session_dir:
+                #     input_path = session_dir / f"00c_cropped_input_{card_side}.jpg"
+                #     cv2.imwrite(str(input_path), img)
             else:
                 logger.info("No crop coordinates provided, using full image")
 
@@ -538,10 +538,10 @@ class EntityAgent:
         logger.info(f"  Detected {len(card_detections)} entities")
         
         # Save annotated image
-        if self.save_debug_images and session_dir:
-            annotated_path = session_dir / f"01_detections_{card_side}_annotated.jpg"
-            cv2.imwrite(str(annotated_path), annotated_img)
-            logger.info(f"Saved annotated detections: {annotated_path}")
+        # if self.save_debug_images and session_dir:
+        #     annotated_path = session_dir / f"01_detections_{card_side}_annotated.jpg"
+        #     cv2.imwrite(str(annotated_path), annotated_img)
+        #     logger.info(f"Saved annotated detections: {annotated_path}")
         
         if not card_detections:
             return {}
@@ -563,9 +563,9 @@ class EntityAgent:
         
         # Create crops directory
         crops_dir = None
-        if self.save_debug_images and session_dir:
-            crops_dir = session_dir if isinstance(session_dir, Path) and session_dir.name.startswith("crops") else session_dir / "crops"
-            crops_dir.mkdir(exist_ok=True)
+        # if self.save_debug_images and session_dir:
+        #     crops_dir = session_dir if isinstance(session_dir, Path) and session_dir.name.startswith("crops") else session_dir / "crops"
+        #     crops_dir.mkdir(exist_ok=True)
         
         for card_name, card_data in all_detections.items():
             img = card_data['card_image']
@@ -590,13 +590,13 @@ class EntityAgent:
                 detection['entity_key'] = entity_key
                 
                 # Save individual crop
-                if self.save_debug_images and crops_dir:
-                    class_name = detection['class_name']
-                    conf = detection['confidence']
-                    crop_filename = f"{card_type}_{class_name}_{i}_conf{conf:.2f}.jpg"
-                    crop_path = crops_dir / crop_filename
-                    cv2.imwrite(str(crop_path), crop)
-                    logger.info(f"  Saved crop: {crop_filename}")
+                # if self.save_debug_images and crops_dir:
+                #     class_name = detection['class_name']
+                #     conf = detection['confidence']
+                #     crop_filename = f"{card_type}_{class_name}_{i}_conf{conf:.2f}.jpg"
+                #     crop_path = crops_dir / crop_filename
+                #     cv2.imwrite(str(crop_path), crop)
+                #     logger.info(f"  Saved crop: {crop_filename}")
         
         return all_detections
     
