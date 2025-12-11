@@ -21,3 +21,9 @@ simple_extractor.py
 testing/
 ocr_temp/
 debug_output/
+google_sheets_credentials.json
+GOOGLE_SHEETS_SETUP.md
+google_sheets_credentials.textClipping
+.env.example
+GOOGLE_SHEETS_QUICKFIX.md
+test_google_sheets.py

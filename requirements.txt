@@ -20,3 +20,4 @@ transformers
 brotlipy
 requests
 cloudscraper
+gspread

@@ -5,7 +5,7 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
-
+import gspread
 
 BASE_URL = "https://qoneqt.com/v1/api"
 ADMIN_ID = 27  
@@ -60,6 +60,116 @@ current_session = {
     "users_processed": [],
     "agent_id": None
 }
+
+class GoogleSheetLogger:
+    def __init__(self, creds_file, sheet_name):
+        """
+        Initialize Google Sheets logger
+        :param creds_file: Path to Google Service Account JSON credentials
+        :param sheet_name: Name of the Google Sheet to log to
+        """
+        try:
+            self.gc = gspread.service_account(filename=creds_file)
+            self.sh = self.gc.open(sheet_name)
+            self.worksheet = self.sh.sheet1
+            
+            # Check if headers exist, if not create them
+            headers = self.worksheet.row_values(1)
+            if not headers:
+                self._create_headers()
+                logger.info("✅ Created Google Sheets headers")
+            else:
+                logger.info("✅ Connected to existing Google Sheet")
+                
+        except FileNotFoundError:
+            logger.error(f"❌ Google Sheets credentials file not found: {creds_file}")
+            raise
+        except gspread.exceptions.SpreadsheetNotFound:
+            logger.error(f"❌ Google Sheet '{sheet_name}' not found. Please create it or share it with the service account.")
+            raise
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize Google Sheets: {e}")
+            raise
+    
+    def _create_headers(self):
+        """Create column headers for the sheet"""
+        headers = [
+            "Timestamp",
+            "User ID",
+            "Agent ID",
+            "Batch Number",
+            "Final Decision",
+            "Status Code",
+            "Score",
+            "Face Similarity",
+            "Age Verification",
+            "Gender Match",
+            "DOB Match",
+            "Input DOB",
+            "Input Gender",
+            "Extracted DOB",
+            "Extracted Gender",
+            "Extracted Aadhaar",
+            "Rejection Reasons",
+            "Total Processing Time (s)",
+            "AI Processing Time (s)",
+            "Has Errors",
+            "Error Count",
+            "Session ID"
+        ]
+        self.worksheet.append_row(headers)
+        # Format headers (bold)
+        self.worksheet.format('A1:V1', {
+            "textFormat": {"bold": True},
+            "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9}
+        })
+
+    def log(self, user_log):
+        """
+        Log user processing data to Google Sheets
+        :param user_log: Dictionary containing user processing information
+        """
+        try:
+            final_result = user_log.get("final_result", {})
+            breakdown = final_result.get("breakdown", {})
+            extracted_data = final_result.get("extracted_data", {})
+            timing = user_log.get("timing", {})
+            input_data = user_log.get("input_data", {})
+            
+            row_data = [
+                user_log.get("timestamp", ""),
+                user_log.get("user_id", ""),
+                user_log.get("agent_id", ""),
+                user_log.get("batch_number", ""),
+                final_result.get("final_decision", ""),
+                final_result.get("status_code", ""),
+                final_result.get("score", 0),
+                breakdown.get("face_similarity", 0),
+                breakdown.get("age_verification", 0),
+                breakdown.get("gender_match", 0),
+                breakdown.get("dob_match", 0),
+                input_data.get("dob", ""),
+                input_data.get("gender", ""),
+                extracted_data.get("dob", ""),
+                extracted_data.get("gender", ""),
+                extracted_data.get("aadhaar", ""),
+                ", ".join(final_result.get("rejection_reasons", [])),
+                round(timing.get("total_time", 0), 2),
+                round(timing.get("ai_processing_time", 0), 2),
+                "Yes" if len(user_log.get("errors", [])) > 0 else "No",
+                len(user_log.get("errors", [])),
+                user_log.get("session_id", "")
+            ]
+            
+            self.worksheet.append_row(row_data)
+            logger.info(f"📊 Logged User {user_log.get('user_id')} to Google Sheets")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to log to Google Sheets: {e}")
+            # Don't raise - we don't want to break the pipeline if logging fails
+
+# Global Google Sheets logger instance (will be initialized in main)
+google_sheet_logger = None
 
 def create_session_log_file(agent_id):
     """Create a new session log file for this run"""
@@ -621,6 +731,13 @@ async def process_single_user(session, user, session_dir, agent_id):
     save_user_log(user_id, user_log, session_dir)
     current_session["users_processed"].append(user_id)
     
+    # Log to Google Sheets if enabled
+    if google_sheet_logger:
+        try:
+            google_sheet_logger.log(user_log)
+        except Exception as e:
+            logger.error(f"Failed to log User {user_id} to Google Sheets: {e}")
+    
     return user_log
 
 async def process_agent_batch(session, agent_id, session_dir):
@@ -707,9 +824,26 @@ async def process_agent_batch(session, agent_id, session_dir):
 
 async def run_pipeline():
     """Main pipeline that cycles through all agents continuously"""
+    global google_sheet_logger
+    
     async with aiohttp.ClientSession() as session:
         try:
             agent_sessions = {}
+            
+            # Initialize Google Sheets Logger (optional)
+            # Set GOOGLE_SHEETS_ENABLED=true and provide credentials to enable
+            import os
+            if os.getenv("GOOGLE_SHEETS_ENABLED", "false").lower() == "true":
+                try:
+                    creds_file = os.getenv("GOOGLE_SHEETS_CREDENTIALS", "google_sheets_credentials.json")
+                    sheet_name = os.getenv("GOOGLE_SHEETS_NAME", "KYC Verification Logs")
+                    google_sheet_logger = GoogleSheetLogger(creds_file, sheet_name)
+                    logger.info(f"✅ Google Sheets logging enabled: '{sheet_name}'")
+                except Exception as e:
+                    logger.error(f"❌ Failed to initialize Google Sheets: {e}")
+                    logger.info("Continuing without Google Sheets logging...")
+            else:
+                logger.info("ℹ️ Google Sheets logging disabled (set GOOGLE_SHEETS_ENABLED=true to enable)")
             
             # Create session directories for each agent
             for agent_id in AGENT_IDS:
