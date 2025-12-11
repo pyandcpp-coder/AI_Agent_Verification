@@ -1,9 +1,11 @@
 import cv2
 from ultralytics import YOLO
 import numpy as np
+from pathlib import Path
+from datetime import datetime
 
 class DocAgent:
-    def __init__(self, model_path="models/best4.pt"):
+    def __init__(self, model_path="models/best4.pt", save_debug_images=True):
         # Load model once when server starts
         print(f"Loading Document Model from {model_path}...")
         self.model = YOLO(model_path)
@@ -11,6 +13,13 @@ class DocAgent:
         self.retry_threshold = 0.30  # If best detection is below this, try zooming
         self.zoom_levels = [1.5, 2.0]  # Zoom factors to try
         self.tile_overlap = 0.2  # 20% overlap between tiles
+        self.save_debug_images = save_debug_images
+        
+        # Create debug output directories
+        if self.save_debug_images:
+            self.debug_base_dir = Path("debug_output/doc_detection")
+            self.debug_base_dir.mkdir(parents=True, exist_ok=True)
+            print(f"Document detection debug images will be saved to: {self.debug_base_dir}")
     
     def create_tiles(self, img, zoom_factor=1.5):
         """
@@ -50,12 +59,14 @@ class DocAgent:
         print(f"  [Tiling] Created {len(tiles)} tiles")
         return tiles
 
-    def _detect(self, img, prefer_front=False):
+    def _detect(self, img, prefer_front=False, image_name="image", session_dir=None):
         """Helper to run detection on a single loaded image with retry mechanism
         
         Args:
             img: Input image
             prefer_front: If True, prioritize aadhar_front over aadhar_back when both are detected
+            image_name: Name for saving debug images
+            session_dir: Directory to save debug images
         """
         # First attempt: Full image detection
         print("  [Detection] Running on full image...")
@@ -65,6 +76,9 @@ class DocAgent:
         max_conf = 0.0
         best_box = None
         all_detections = []
+
+        # Create visualization image
+        viz_img = img.copy()
 
         for box in results[0].boxes:
             conf = float(box.conf)
@@ -76,6 +90,17 @@ class DocAgent:
                 box_coords = box.xyxy[0].cpu().numpy().astype(int)
                 all_detections.append((label, conf, box_coords))
                 
+                # Draw ALL detections on visualization
+                x1, y1, x2, y2 = box_coords
+                color = (0, 255, 0) if 'front' in label.lower() else (0, 0, 255)  # Green for front, Red for back
+                cv2.rectangle(viz_img, (x1, y1), (x2, y2), color, 3)
+                
+                # Add label
+                label_text = f"{label}: {conf:.3f}"
+                (label_w, label_h), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.rectangle(viz_img, (x1, y1 - label_h - 10), (x1 + label_w, y1), color, -1)
+                cv2.putText(viz_img, label_text, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                
                 # Track highest confidence
                 if conf > max_conf:
                     max_conf = conf
@@ -83,6 +108,12 @@ class DocAgent:
                     best_box = box_coords
 
         print(f"  [Detection] Full image: found {len(all_detections)} detection(s), max_conf={max_conf:.4f}")
+        
+        # Save visualization with ALL detections
+        if self.save_debug_images and session_dir:
+            viz_path = session_dir / f"best4_detections_{image_name}_all.jpg"
+            cv2.imwrite(str(viz_path), viz_img)
+            print(f"  [Debug] Saved all detections: {viz_path}")
         
         # If prefer_front is enabled and we have multiple detections, prioritize front
         if prefer_front and len(all_detections) > 1:
@@ -92,6 +123,23 @@ class DocAgent:
                 front_detections.sort(key=lambda x: x[1], reverse=True)
                 best_label, max_conf, best_box = front_detections[0]
                 print(f"  [Priority] Prioritizing front detection: {best_label} @ {max_conf:.4f}")
+        
+        # Save final selected detection
+        if self.save_debug_images and session_dir and best_box is not None:
+            final_viz_img = img.copy()
+            x1, y1, x2, y2 = best_box
+            color = (0, 255, 0)  # Green for selected
+            cv2.rectangle(final_viz_img, (x1, y1), (x2, y2), color, 4)
+            
+            # Add SELECTED label
+            label_text = f"SELECTED: {best_label}: {max_conf:.3f}"
+            (label_w, label_h), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+            cv2.rectangle(final_viz_img, (x1, y1 - label_h - 15), (x1 + label_w, y1), color, -1)
+            cv2.putText(final_viz_img, label_text, (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+            
+            final_viz_path = session_dir / f"best4_detections_{image_name}_SELECTED.jpg"
+            cv2.imwrite(str(final_viz_path), final_viz_img)
+            print(f"  [Debug] Saved selected detection: {final_viz_path}")
         
         # If no detection or low confidence, try zooming
         if (best_label is None or max_conf < self.retry_threshold):
@@ -156,6 +204,14 @@ class DocAgent:
         2. Checks if Front and Back are present.
         3. Returns coordinates of the Front card for the next step.
         """
+        # Create session-specific debug directory
+        session_dir = None
+        if self.save_debug_images:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            session_dir = self.debug_base_dir / f"session_{timestamp}"
+            session_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[DocAgent] Session debug directory: {session_dir}")
+        
         # 1. Read Images
         img_f = cv2.imread(front_path)
         img_b = cv2.imread(back_path)
@@ -165,10 +221,16 @@ class DocAgent:
         if img_b is None:
             return {"success": False, "message": f"Could not read file: {back_path}"}
 
+        # Save original input images
+        if self.save_debug_images and session_dir:
+            cv2.imwrite(str(session_dir / "00_input_front.jpg"), img_f)
+            cv2.imwrite(str(session_dir / "00_input_back.jpg"), img_b)
+            print(f"[DocAgent] Saved input images to: {session_dir}")
+
         # 2. Run Detection
         # For front image, prefer aadhar_front if both front and back are detected
-        label_f, conf_f, box_f = self._detect(img_f, prefer_front=True)
-        label_b, conf_b, box_b = self._detect(img_b, prefer_front=False)
+        label_f, conf_f, box_f = self._detect(img_f, prefer_front=True, image_name="FRONT", session_dir=session_dir)
+        label_b, conf_b, box_b = self._detect(img_b, prefer_front=False, image_name="BACK", session_dir=session_dir)
 
         # Log detections
         print(f"\n=== Document Detection Results ===")
@@ -207,8 +269,49 @@ class DocAgent:
 
         # 4. Success - Return the coordinates!
         # We return box_f so the Entity Agent can crop perfectly.
+        # Also create a final summary visualization
+        if self.save_debug_images and session_dir:
+            # Create side-by-side comparison
+            h_f, w_f = img_f.shape[:2]
+            h_b, w_b = img_b.shape[:2]
+            max_h = max(h_f, h_b)
+            
+            # Resize images to same height
+            scale_f = max_h / h_f
+            scale_b = max_h / h_b
+            img_f_resized = cv2.resize(img_f, (int(w_f * scale_f), max_h))
+            img_b_resized = cv2.resize(img_b, (int(w_b * scale_b), max_h))
+            
+            # Draw boxes on resized images
+            if box_f is not None:
+                x1, y1, x2, y2 = box_f
+                x1, y1, x2, y2 = int(x1*scale_f), int(y1*scale_f), int(x2*scale_f), int(y2*scale_f)
+                cv2.rectangle(img_f_resized, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                cv2.putText(img_f_resized, f"{label_f}: {conf_f:.3f}", (x1, y1-10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            if box_b is not None:
+                x1, y1, x2, y2 = box_b
+                x1, y1, x2, y2 = int(x1*scale_b), int(y1*scale_b), int(x2*scale_b), int(y2*scale_b)
+                cv2.rectangle(img_b_resized, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                cv2.putText(img_b_resized, f"{label_b}: {conf_b:.3f}", (x1, y1-10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            
+            # Concatenate side by side
+            comparison = np.hstack([img_f_resized, img_b_resized])
+            
+            # Add title (ensure integers for coordinates)
+            front_width = int(w_f * scale_f)
+            cv2.putText(comparison, "FRONT", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+            cv2.putText(comparison, "BACK", (front_width + 50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
+            
+            comparison_path = session_dir / "99_FINAL_comparison.jpg"
+            cv2.imwrite(str(comparison_path), comparison)
+            print(f"[DocAgent] Saved final comparison: {comparison_path}")
+        
         return {
             "success": True,
             "message": "Both documents verified",
-            "front_coords": box_f.tolist()  # Convert numpy array to list [x1, y1, x2, y2]
+            "front_coords": box_f.tolist(),  # Convert numpy array to list [x1, y1, x2, y2]
+            "debug_dir": str(session_dir) if session_dir else None
         }
