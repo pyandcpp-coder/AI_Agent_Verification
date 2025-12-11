@@ -1,8 +1,7 @@
+# AI Agent Verification System
 
-# Aadhaar Verification System
-
-An automated identity verification system that validates Aadhaar cards using computer vision, OCR, and face recognition technology. The system performs multi-stage verification including document detection, entity extraction, face similarity matching, and compliance scoring.
->>>>>>> 863a9a4 (Readme.md added)
+An automated identity verification system that validates using computer vision, OCR, and face recognition technology. The system performs multi-stage verification including document detection, entity extraction, face similarity matching, and compliance scoring.
+>>>>>>> 8d2312f (change in Readme.md)
 
 ## Overview
 
