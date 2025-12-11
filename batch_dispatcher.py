@@ -9,7 +9,7 @@ from pathlib import Path
 
 BASE_URL = "https://qoneqt.com/v1/api"
 ADMIN_ID = 27  
-AGENT_IDS = [77, 78, 79, 80]  # List of agents to process in rotation
+AGENT_IDS = [77, 78, 79, 80]  
 BATCH_SIZE = 20
 TTL_HOURS = 12
 
