@@ -5,10 +5,14 @@ class VerificationScorer:
     def __init__(self):
         # Weights (Total 100) - Original Configuration
         self.weights = {
-            "face": 40,      # Face Similarity
-            "aadhar": 20,    # Valid Aadhaar Number & Masking Check
-            "dob": 20,       # Valid Age/DOB
-            "gender": 20     # Gender Match
+            # "face": 40,      # Face Similarity
+            # "aadhar": 20,    # Valid Aadhaar Number & Masking Check
+            # "dob": 20,       # Valid Age/DOB
+            # "gender": 20     # Gender Match
+            "face": 20,      # Face Similarity (reduced from 40)
+            "aadhar": 30,    # Valid Aadhaar Number (increased from 20)
+            "dob": 30,       # Valid Age/DOB (increased from 20)
+            "gender": 20     # Gender Match (unchanged)
         }
     
     def _normalize_dob(self, dob_string):
@@ -28,24 +32,19 @@ class VerificationScorer:
         rejection_reasons = []
         critical_failure = False  # If True, status is REJECTED regardless of score
 
-        # --- 1. Face Similarity (0 - 40 points) ---
+        # --- 1. Face Similarity (0 - 20 points) ---
         face_sim = face_data.get("score", 0)
         low_face_sim = False
         
-        # If face similarity is less than 5%, auto-reject
         if face_sim < 5:
-            breakdown["face_score"] = 0
-            critical_failure = True
-            rejection_reasons.append(f"Very Low Face Similarity (Similarity: {face_sim:.2f}%)")
-        elif face_sim < 15:
-            # Low face similarity - Flag it but don't auto-reject yet
+            # Very low face similarity - Give 0 points and flag for review
             breakdown["face_score"] = 0
             low_face_sim = True
             rejection_reasons.append(f"Low Face Similarity (Similarity: {face_sim:.2f}%)")
         else:
-            # Between 16% and 100% -> Scale linearly to 0-40 points
-            # Formula: ((Score - 16) / 84) * 40, where 84 is the range (100-16)
-            face_points = ((face_sim - 16) / 84) * 40
+            # Between 5% and 100% -> Scale linearly to 0-20 points
+            # Formula: ((Score - 5) / 95) * 20, where 95 is the range (100-5)
+            face_points = ((face_sim - 5) / 95) * self.weights["face"]
             score += face_points
             breakdown["face_score"] = round(face_points, 2)
 
