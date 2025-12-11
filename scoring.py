@@ -32,7 +32,12 @@ class VerificationScorer:
         face_sim = face_data.get("score", 0)
         low_face_sim = False
         
-        if face_sim < 16:
+        # If face similarity is less than 5%, auto-reject
+        if face_sim < 5:
+            breakdown["face_score"] = 0
+            critical_failure = True
+            rejection_reasons.append(f"Very Low Face Similarity (Similarity: {face_sim:.2f}%)")
+        elif face_sim < 15:
             # Low face similarity - Flag it but don't auto-reject yet
             breakdown["face_score"] = 0
             low_face_sim = True
@@ -139,12 +144,13 @@ class VerificationScorer:
         # --- FINAL DECISION ---
         if critical_failure:
             status = "REJECTED"
-        elif low_face_sim and score >= 60:
-            # Low face similarity but high overall score -> REVIEW
-            status = "REVIEW"
-        elif score > 61:
+        elif score > 60.1:
+            # High score -> APPROVED (even with low face sim)
             status = "APPROVED"
-        elif 40 <= score <= 61:
+        elif low_face_sim and score >= 60:
+            # Low face similarity but decent score -> REVIEW
+            status = "REVIEW"
+        elif 40 <= score <= 60.1:
             status = "REVIEW"
         else:
             status = "REJECTED"
