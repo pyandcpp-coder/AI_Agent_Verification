@@ -13,7 +13,7 @@ AGENT_IDS = [77, 78, 79, 80]
 BATCH_SIZE = 20
 TTL_HOURS = 12
 
-LOCAL_AI_URL = "http://localhost:8100/verification/verify/agent/"
+LOCAL_AI_URL = "http://localhost:8101/verification/verify/agent/"
 
 # Retry configuration for 502 errors
 MAX_RETRIES = 3
