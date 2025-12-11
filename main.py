@@ -5,10 +5,13 @@ import asyncio
 import aiohttp
 import aiofiles
 import cloudscraper
+import gc
+import weakref
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from pathlib import Path
 from typing import Optional, Union
+from contextlib import asynccontextmanager
 
 # Ensure the current directory is in the Python path
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -28,62 +31,81 @@ except ImportError as e:
     print(f"sys.path: {sys.path}")
     raise
 
-app = FastAPI()
-
 # --- Global State ---
 face_agent = None
 doc_agent = None
 entity_agent = None
 gender_pipeline = None
 scorer = None
-http_session = None  # Reusable aiohttp session
+http_session = None
 
 TEMP_DIR = Path("temp")
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize all heavy models once at startup to save RAM/Time."""
+# Track active sessions with weak references to prevent memory leaks
+active_sessions = weakref.WeakSet()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown."""
     global face_agent, doc_agent, entity_agent, gender_pipeline, scorer, http_session
     
-    # Create temp dir if not exists
+    # Startup
     TEMP_DIR.mkdir(exist_ok=True)
-
     print("--- STARTING SYSTEM INITIALIZATION ---")
     
-    # Create persistent HTTP session with connection limits
+    # Create persistent HTTP session with stricter connection limits
     connector = aiohttp.TCPConnector(
-        limit=100,  # Max total connections
-        limit_per_host=30,  # Max connections per host
-        ttl_dns_cache=300,  # DNS cache timeout
-        force_close=True  # Force close connections after each request
+        limit=50,  # Reduced from 100
+        limit_per_host=10,  # Reduced from 30
+        ttl_dns_cache=300,
+        force_close=True,
+        enable_cleanup_closed=True
     )
-    http_session = aiohttp.ClientSession(connector=connector)
+    timeout = aiohttp.ClientTimeout(total=30, connect=10)
+    http_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+    active_sessions.add(http_session)
     
-    face_agent = FaceAgent()        # Loads InsightFace (Face + Gender)
-    doc_agent = DocAgent()          # Loads YOLO for Doc Detection
-    entity_agent = EntityAgent()    # Loads YOLO for Entities + Tesseract
-    gender_pipeline = GenderPipeline() # Loads Specialized Gender Pipeline
-    scorer = VerificationScorer()   # Loads Scoring Logic
+    face_agent = FaceAgent()
+    doc_agent = DocAgent()
+    entity_agent = EntityAgent()
+    gender_pipeline = GenderPipeline()
+    scorer = VerificationScorer()
     
     # Start background cleanup task
-    asyncio.create_task(periodic_cleanup())
+    cleanup_task = asyncio.create_task(periodic_cleanup())
     
     print("--- SYSTEM READY ---")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup resources on shutdown."""
-    global http_session
+    
+    yield
+    
+    # Shutdown
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
+    
     if http_session:
         await http_session.close()
+        await asyncio.sleep(0.25)  # Give time for connections to close
+    
+    # Final cleanup of temp directory
+    if TEMP_DIR.exists():
+        try:
+            shutil.rmtree(TEMP_DIR, ignore_errors=True)
+        except Exception as e:
+            print(f"Final cleanup error: {e}")
+    
     print("--- SYSTEM SHUTDOWN ---")
 
+app = FastAPI(lifespan=lifespan)
+
 async def periodic_cleanup():
-    """Background task to clean up old temp directories every 5 minutes."""
+    """Background task to clean up old temp directories every 2 minutes."""
     import time
     while True:
         try:
-            await asyncio.sleep(300)  # Run every 5 minutes
+            await asyncio.sleep(120)  # Run every 2 minutes (reduced from 5)
             
             if not TEMP_DIR.exists():
                 continue
@@ -91,241 +113,216 @@ async def periodic_cleanup():
             current_time = time.time()
             cleaned_count = 0
             
-            # Delete directories older than 10 minutes
+            # Delete directories older than 5 minutes (reduced from 10)
             for user_dir in TEMP_DIR.iterdir():
                 if not user_dir.is_dir():
                     continue
                 
-                # Check directory age
                 dir_age = current_time - user_dir.stat().st_mtime
-                if dir_age > 600:  # 10 minutes
+                if dir_age > 300:  # 5 minutes
                     try:
-                        import gc
-                        gc.collect()
-                        shutil.rmtree(user_dir, ignore_errors=True)
+                        force_cleanup_directory(user_dir)
                         cleaned_count += 1
                     except Exception as e:
                         print(f"Periodic cleanup failed for {user_dir}: {e}")
             
             if cleaned_count > 0:
                 print(f"Periodic cleanup: Removed {cleaned_count} old temp directories")
+                gc.collect()  # Force garbage collection after cleanup
                 
         except Exception as e:
             print(f"Error in periodic cleanup: {e}")
 
-# --- INPUT MODEL MATCHING YOUR SPECIFIC JSON FORMAT ---
+def force_cleanup_directory(directory: Path, max_retries: int = 3):
+    """Aggressively cleanup a directory with retries."""
+    for attempt in range(max_retries):
+        try:
+            # Force garbage collection to close file handles
+            gc.collect()
+            
+            # Try to close any open file descriptors in this directory
+            try:
+                import resource
+                soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+                # Don't check all FDs, just do aggressive cleanup
+            except:
+                pass
+            
+            # First try: normal removal
+            if attempt == 0:
+                shutil.rmtree(directory, ignore_errors=False)
+                return
+            
+            # Second try: ignore errors
+            if attempt == 1:
+                shutil.rmtree(directory, ignore_errors=True)
+                if not directory.exists():
+                    return
+            
+            # Final try: manual file-by-file deletion
+            if directory.exists():
+                for item in directory.rglob('*'):
+                    try:
+                        if item.is_file():
+                            item.unlink(missing_ok=True)
+                        elif item.is_dir():
+                            try:
+                                item.rmdir()
+                            except:
+                                pass
+                    except Exception:
+                        pass
+                
+                try:
+                    directory.rmdir()
+                except:
+                    pass
+            
+            if not directory.exists():
+                return
+                
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"Failed to cleanup {directory} after {max_retries} attempts: {e}")
+            else:
+                import time
+                time.sleep(0.1 * (attempt + 1))  # Progressive backoff
+
+# --- INPUT MODEL ---
 class VerifyRequest(BaseModel):
     user_id: Union[int, str]
-    dob: Optional[str] = None          # e.g., "06-12-2007"
-    passport_first: str                # Front Aadhaar (URL or Local Path)
-    passport_old: str                  # Back Aadhaar (URL or Local Path)
-    selfie_photo: str                  # Selfie (URL or Local Path)
-    gender: Optional[str] = None       # "Male/Female/Other"
+    dob: Optional[str] = None
+    passport_first: str
+    passport_old: str
+    selfie_photo: str
+    gender: Optional[str] = None
 
 async def fetch_file(session: aiohttp.ClientSession, source: str, destination: Path) -> bool:
     """
-    Hybrid Fetcher:
-    - If source is http/https -> Downloads it using cloudscraper (bypasses Cloudflare).
-    - If source is a local path -> Copies it.
+    Hybrid Fetcher with proper resource management.
     """
     try:
         if str(source).startswith(('http://', 'https://')):
-            # Use cloudscraper in a thread executor to bypass Cloudflare
-            # cloudscraper handles JS challenges, TLS fingerprinting, and cookies automatically
             loop = asyncio.get_event_loop()
             
             def download_with_cloudscraper(url: str) -> bytes:
                 scraper = cloudscraper.create_scraper(
                     browser={
                         'browser': 'chrome',
-                        'platform': 'darwin',  # macOS
+                        'platform': 'darwin',
                         'mobile': False
                     }
                 )
-                response = scraper.get(url, timeout=30)
-                response.raise_for_status()
-                return response.content
+                try:
+                    response = scraper.get(url, timeout=30)
+                    response.raise_for_status()
+                    return response.content
+                finally:
+                    # Ensure scraper session is closed
+                    if hasattr(scraper, 'close'):
+                        scraper.close()
             
-            # Run the blocking cloudscraper call in executor
             content = await loop.run_in_executor(None, download_with_cloudscraper, str(source))
             
-            # Write content to file
+            # Write content to file with explicit close
             async with aiofiles.open(destination, 'wb') as f:
                 await f.write(content)
             
-            print(f"Successfully downloaded: {source} ({len(content)} bytes)")
+            print(f"Downloaded: {source} ({len(content)} bytes)")
             return True
             
         else:
-            # Assume local path (e.g., "uploads/38070/...")
-            # We resolve it relative to the current working directory
             source_path = Path(source)
             if source_path.exists():
-                shutil.copy(source_path, destination)
+                # Use copy2 to preserve metadata
+                shutil.copy2(source_path, destination)
                 return True
             else:
                 print(f"Local file not found: {source}")
     except Exception as e:
         print(f"Error fetching {source}: {e}")
-        import traceback
-        traceback.print_exc()
     return False
 
 async def setup_files(user_id: str, req: VerifyRequest):
-    """
-    Sets up the temp environment: temp/{user_id}/...
-    renaming files to standard names for processing.
-    """
+    """Sets up temp environment with aggressive cleanup."""
     task_dir = TEMP_DIR / str(user_id)
     
-    # Clean existing directory if it exists to ensure fresh start
+    # Clean existing directory if it exists
     if task_dir.exists():
-        try:
-            # Force close any open file handles before deletion
-            import gc
-            gc.collect()  # Force garbage collection to close file handles
-            
-            # Use ignore_errors for more robust cleanup
-            shutil.rmtree(task_dir, ignore_errors=True)
-            
-            # If still exists, try manual deletion
-            if task_dir.exists():
-                for item in task_dir.rglob('*'):
-                    try:
-                        if item.is_file():
-                            item.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                task_dir.rmdir()
-        except Exception as e:
-            print(f"Warning: Could not fully clean {task_dir}: {e}")
-            # Continue anyway - will overwrite files
+        force_cleanup_directory(task_dir)
     
     task_dir.mkdir(parents=True, exist_ok=True)
 
-    # Define standard filenames for internal processing
-    # Structure: {user_id}/{user_id}_{type}.jpg
     paths = {
         "selfie": task_dir / f"{user_id}_selfie.jpg",
         "front": task_dir / f"{user_id}_aadhar_front.jpg",
         "back": task_dir / f"{user_id}_aadhar_back.jpg"
     }
 
-    # Use the global session instead of creating new ones
     global http_session
-    # Fetch all 3 concurrently
     results = await asyncio.gather(
         fetch_file(http_session, req.selfie_photo, paths["selfie"]),
         fetch_file(http_session, req.passport_first, paths["front"]),
-        fetch_file(http_session, req.passport_old, paths["back"])
+        fetch_file(http_session, req.passport_old, paths["back"]),
+        return_exceptions=True
     )
 
-    # Check if all files were successfully retrieved
-    if all(results):
-        # Return string paths for OpenCV compatibility
+    # Check results
+    if all(r is True for r in results):
         return {k: str(v) for k, v in paths.items()}, task_dir
     else:
-        # Cleanup immediately if any file failed
-        try:
-            shutil.rmtree(task_dir, ignore_errors=True)
-        except Exception:
-            pass
+        force_cleanup_directory(task_dir)
         return None, None
 
 @app.post("/verification/verify")
 async def verify_user(req: VerifyRequest):
-    """Full verification endpoint with detailed breakdown (for testing/debugging)"""
+    """Full verification endpoint with detailed breakdown."""
     user_id = str(req.user_id)
     print(f"[{user_id}] New Verification Request")
 
-    # 1. Setup Files (Download/Copy)
     files, task_dir = await setup_files(user_id, req)
     if not files:
         return {
             "user_id": user_id,
             "status": "FAILED", 
-            "reason": "File Retrieval Failed (Check URLs or Paths)"
+            "reason": "File Retrieval Failed"
         }
 
     try:
-        # 2. Parallel Execution Setup
         loop = asyncio.get_event_loop()
         
-        # --- TASK A: Face Check (CPU/GPU Bound) ---
-        # Compares Selfie <-> Front Card
-        face_task = loop.run_in_executor(
-            None, 
-            face_agent.compare, 
-            files['selfie'], 
-            files['front']
-        )
+        face_task = loop.run_in_executor(None, face_agent.compare, files['selfie'], files['front'])
 
-        # --- TASK B: Doc & Entity Pipeline ---
         async def run_doc_pipeline():
-            # B1: Document Verification
-            # Checks if Front/Back are valid Aadhaar cards & Gets Coordinates
-            doc_res = await loop.run_in_executor(
-                None, 
-                doc_agent.verify_documents, 
-                files['front'], 
-                files['back']
-            )
+            doc_res = await loop.run_in_executor(None, doc_agent.verify_documents, files['front'], files['back'])
             
-            # Fail Fast: If detection fails, stop pipeline here
             if not doc_res['success']:
                 return {"success": False, "reason": doc_res['message'], "data": {}}
 
-            # B2: Entity Extraction (Original) & Gender Extraction (Specialized)
-            # Run both in parallel for speed
-            
-            # Task: Generic Entity Extraction (Name, DOB, Aadhaar No)
             front_coords = doc_res.get('front_coords')
-            entity_task = loop.run_in_executor(
-                None, 
-                entity_agent.extract_from_file, 
-                files['front'], 
-                front_coords
-            )
+            entity_task = loop.run_in_executor(None, entity_agent.extract_from_file, files['front'], front_coords)
+            gender_task = loop.run_in_executor(None, gender_pipeline.detect_gender, files['front'])
             
-            # Task: Specialized Gender Detection (using gender_pipeline)
-            gender_task = loop.run_in_executor(
-                None,
-                gender_pipeline.detect_gender,
-                files['front']
-            )
-            
-            # Wait for both extractions
             entity_res, gender_res = await asyncio.gather(entity_task, gender_task)
             
-            # B3: Merge Results with Logic
             merged_data = entity_res.get('data', {})
             ocr_gender = merged_data.get('gender', 'Other')
             
-            # Logic: If OCR Gender is 'Other' or 'Not Detected', try to use Specialized Pipeline
-            # gender_res is a GenderDetectionResult object
             if ocr_gender in ['Other', 'Not Detected', None] and gender_res.face_detected:
-                detected_gender = gender_res.gender.capitalize()  # 'male' -> 'Male', 'female' -> 'Female'
+                detected_gender = gender_res.gender.capitalize()
                 if detected_gender in ['Male', 'Female']:
-                    print(f"[{user_id}] OCR Gender '{ocr_gender}' -> Fallback to Pipeline: {detected_gender}")
+                    print(f"[{user_id}] OCR Gender '{ocr_gender}' -> Fallback: {detected_gender}")
                     merged_data['gender'] = detected_gender
-                    # Add a flag so scorer knows we used fallback
                     merged_data['gender_source'] = 'pipeline'
                 else:
                     merged_data['gender_source'] = 'ocr_failed'
             else:
                 merged_data['gender_source'] = 'ocr'
             
-            return {
-                "success": True, 
-                "data": merged_data
-            }
+            return {"success": True, "data": merged_data}
 
-        # Execute both branches concurrently
         face_score, doc_pipeline_res = await asyncio.gather(face_task, run_doc_pipeline())
 
-        # 3. Aggregation Logic
-        
-        # If Document Pipeline failed (e.g., card not found), Reject immediately
         if not doc_pipeline_res['success']:
             return {
                 "user_id": user_id,
@@ -334,28 +331,18 @@ async def verify_user(req: VerifyRequest):
                 "reason": doc_pipeline_res.get('reason', 'Document Verification Failed')
             }
 
-        # 4. Final Scoring
         entity_data = doc_pipeline_res['data']
-        
-        # Normalize Input Gender for comparison
         expected_gender = req.gender.lower() if req.gender else None
         expected_dob = req.dob if req.dob else None
         
-        # Calculate Score
         final_result = scorer.calculate_score(
-            face_data=face_score, # Contains {'score':..., 'gender_img2':...}
+            face_data=face_score,
             entity_data=entity_data,
             expected_gender=expected_gender,
             expected_dob=expected_dob
         )
 
-        # 5. Construct Final Response
-        # Map status to status code
-        status_code_map = {
-            "APPROVED": 2,
-            "REJECTED": 1,
-            "REVIEW": 0
-        }
+        status_code_map = {"APPROVED": 2, "REJECTED": 1, "REVIEW": 0}
         status_code = status_code_map.get(final_result['status'], 0)
         
         return {
@@ -386,106 +373,50 @@ async def verify_user(req: VerifyRequest):
         }
 
     finally:
-        # 6. Cleanup
-        # Always delete the temp folder for this user after processing
+        # Immediate cleanup
         if task_dir and task_dir.exists():
-            try:
-                # Force garbage collection to release file handles
-                import gc
-                gc.collect()
-                
-                # Use ignore_errors for robust cleanup
-                shutil.rmtree(task_dir, ignore_errors=True)
-                
-                # If still exists, force delete files individually
-                if task_dir.exists():
-                    for item in task_dir.rglob('*'):
-                        try:
-                            if item.is_file():
-                                item.unlink(missing_ok=True)
-                        except Exception:
-                            pass
-                    try:
-                        task_dir.rmdir()
-                    except Exception:
-                        pass
-                
-                print(f"[{user_id}] Cleanup Complete")
-            except Exception as e:
-                print(f"[{user_id}] Cleanup Failed: {e}")
+            force_cleanup_directory(task_dir)
+            print(f"[{user_id}] Cleanup Complete")
+        
+        # Force garbage collection
+        gc.collect()
 
 @app.post("/verification/verify/agent/")
 async def verify_user_production(req: VerifyRequest):
-    """Production endpoint - returns only essential verification data"""
+    """Production endpoint - essential data only."""
     user_id = str(req.user_id)
-    print(f"[{user_id}] New Production Verification Request")
+    print(f"[{user_id}] Production Verification Request")
 
-    # 1. Setup Files (Download/Copy)
     files, task_dir = await setup_files(user_id, req)
     if not files:
         return {
             "user_id": user_id,
             "final_decision": "REJECTED",
             "status_code": 1,
-            "extracted_data": {
-                "aadhaar": None,
-                "dob": None,
-                "gender": None
-            }
+            "extracted_data": {"aadhaar": None, "dob": None, "gender": None}
         }
 
     try:
-        # 2. Parallel Execution Setup
         loop = asyncio.get_event_loop()
-        
-        # --- TASK A: Face Check (CPU/GPU Bound) ---
-        face_task = loop.run_in_executor(
-            None, 
-            face_agent.compare, 
-            files['selfie'], 
-            files['front']
-        )
+        face_task = loop.run_in_executor(None, face_agent.compare, files['selfie'], files['front'])
 
-        # --- TASK B: Doc & Entity Pipeline ---
         async def run_doc_pipeline():
-            # B1: Document Verification
-            doc_res = await loop.run_in_executor(
-                None, 
-                doc_agent.verify_documents, 
-                files['front'], 
-                files['back']
-            )
+            doc_res = await loop.run_in_executor(None, doc_agent.verify_documents, files['front'], files['back'])
             
-            # Fail Fast: If detection fails, stop pipeline here
             if not doc_res['success']:
                 return {"success": False, "reason": doc_res['message']}
 
-            # B2: Parallel Extraction (Entity + Gender Pipeline)
             front_coords = doc_res.get('front_coords')
-            
-            entity_task = loop.run_in_executor(
-                None, 
-                entity_agent.extract_from_file, 
-                files['front'], 
-                front_coords
-            )
-            
-            gender_task = loop.run_in_executor(
-                None,
-                gender_pipeline.detect_gender,
-                files['front']
-            )
+            entity_task = loop.run_in_executor(None, entity_agent.extract_from_file, files['front'], front_coords)
+            gender_task = loop.run_in_executor(None, gender_pipeline.detect_gender, files['front'])
             
             entity_res, gender_res = await asyncio.gather(entity_task, gender_task)
             
-            # B3: Merge Results with Logic
             merged_data = entity_res.get('data', {})
             ocr_gender = merged_data.get('gender', 'Other')
             
-            # Override if OCR failed
-            # gender_res is a GenderDetectionResult object
             if ocr_gender in ['Other', 'Not Detected', None] and gender_res.face_detected:
-                detected_gender = gender_res.gender.capitalize()  # 'male' -> 'Male', 'female' -> 'Female'
+                detected_gender = gender_res.gender.capitalize()
                 if detected_gender in ['Male', 'Female']:
                     merged_data['gender'] = detected_gender
                     merged_data['gender_source'] = 'pipeline'
@@ -494,30 +425,19 @@ async def verify_user_production(req: VerifyRequest):
             else:
                 merged_data['gender_source'] = 'ocr'
             
-            return {
-                "success": True, 
-                "data": merged_data
-            }
+            return {"success": True, "data": merged_data}
 
-        # Execute both branches concurrently
         face_score, doc_pipeline_res = await asyncio.gather(face_task, run_doc_pipeline())
 
-        # 3. Aggregation Logic
         if not doc_pipeline_res['success']:
             return {
                 "user_id": user_id,
                 "final_decision": "REJECTED",
                 "status_code": 1,
-                "extracted_data": {
-                    "aadhaar": None,
-                    "dob": None,
-                    "gender": None
-                }
+                "extracted_data": {"aadhaar": None, "dob": None, "gender": None}
             }
 
-        # 4. Final Scoring
         entity_data = doc_pipeline_res['data']
-        
         expected_gender = req.gender.lower() if req.gender else None
         expected_dob = req.dob if req.dob else None
         
@@ -528,12 +448,7 @@ async def verify_user_production(req: VerifyRequest):
             expected_dob=expected_dob
         )
 
-        # 5. Construct Production Response
-        status_code_map = {
-            "APPROVED": 2,
-            "REJECTED": 1,
-            "REVIEW": 0
-        }
+        status_code_map = {"APPROVED": 2, "REJECTED": 1, "REVIEW": 0}
         status_code = status_code_map.get(final_result['status'], 0)
         
         return {
@@ -557,42 +472,15 @@ async def verify_user_production(req: VerifyRequest):
             "user_id": user_id,
             "final_decision": "REJECTED",
             "status_code": 1,
-            "extracted_data": {
-                "aadhaar": None,
-                "dob": None,
-                "gender": None
-            }
+            "extracted_data": {"aadhaar": None, "dob": None, "gender": None}
         }
 
     finally:
-        # 6. Cleanup
         if task_dir and task_dir.exists():
-            try:
-                # Force garbage collection to release file handles
-                import gc
-                gc.collect()
-                
-                # Use ignore_errors for robust cleanup
-                shutil.rmtree(task_dir, ignore_errors=True)
-                
-                # If still exists, force delete files individually
-                if task_dir.exists():
-                    for item in task_dir.rglob('*'):
-                        try:
-                            if item.is_file():
-                                item.unlink(missing_ok=True)
-                        except Exception:
-                            pass
-                    try:
-                        task_dir.rmdir()
-                    except Exception:
-                        pass
-                
-                print(f"[{user_id}] Cleanup Complete")
-            except Exception as e:
-                print(f"[{user_id}] Cleanup Failed: {e}")
+            force_cleanup_directory(task_dir)
+            print(f"[{user_id}] Cleanup Complete")
+        gc.collect()
 
 if __name__ == "__main__":
     import uvicorn
-    # Workers set to 1 to manage heavy model memory usage
     uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)

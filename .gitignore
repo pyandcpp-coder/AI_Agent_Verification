@@ -28,3 +28,4 @@ google_sheets_credentials.textClipping
 GOOGLE_SHEETS_QUICKFIX.md
 test_google_sheets.py
 test_face_similarity.py
+uploads/
