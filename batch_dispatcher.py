@@ -334,7 +334,7 @@ def calculate_session_statistics(session_dir):
 
 async def lock_batch(session, agent_id, retry_count=0):
     """Step 1: Lock a batch of users for this agent with retry logic"""
-    url = f"{BASE_URL}/admin/kyc-my-batch"
+    url = f"{BASE_URL}/admin/kyc-lock-batch"
     payload = {
         "admin_id": ADMIN_ID,
         "target_admin_id": agent_id,
@@ -406,7 +406,7 @@ async def release_batch(session, agent_id, retry_count=0):
 
 async def fetch_user_details(session, agent_id, retry_count=0):
     """Step 2: Get details for the assigned users with retry logic"""
-    url = f"{BASE_URL}/admin/verify-list"
+    url = f"{BASE_URL}/admin/kyc-my-batch"
     payload = {
         "admin_id": agent_id, 
         "page": 1,
