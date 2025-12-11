@@ -13,7 +13,16 @@ AGENT_IDS = [77, 78, 79, 80]
 BATCH_SIZE = 20
 TTL_HOURS = 12
 
-LOCAL_AI_URL = "http://localhost:8000/verification/verify/agent/"
+LOCAL_AI_URL = "http://localhost:8100/verification/verify/agent/"
+
+# Retry configuration for 502 errors
+MAX_RETRIES = 3
+INITIAL_RETRY_DELAY = 5  # seconds
+AGENT_CYCLE_DELAY = 3  # delay between agents
+FULL_CYCLE_DELAY = 10  # delay between full cycles
+
+# Set to False to suppress detailed 502 HTML error logs
+LOG_502_DETAILS = False
 
 LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(exist_ok=True)
@@ -213,8 +222,8 @@ def calculate_session_statistics(session_dir):
     
     return stats
 
-async def lock_batch(session, agent_id):
-    """Step 1: Lock a batch of users for this agent"""
+async def lock_batch(session, agent_id, retry_count=0):
+    """Step 1: Lock a batch of users for this agent with retry logic"""
     url = f"{BASE_URL}/admin/kyc-lock-batch"
     payload = {
         "admin_id": ADMIN_ID,
@@ -232,14 +241,27 @@ async def lock_batch(session, agent_id):
                     return data.get("kyc_ids", [])
                 else:
                     logger.error(f"Failed to lock batch: {data.get('message')}")
+            elif resp.status == 502 and retry_count < MAX_RETRIES:
+                # Server is down, implement exponential backoff
+                wait_time = 2 ** retry_count * INITIAL_RETRY_DELAY  # 5s, 10s, 20s
+                logger.warning(f"⚠️ 502 Bad Gateway for Agent {agent_id}. Server may be down. Retrying in {wait_time}s... (Attempt {retry_count + 1}/{MAX_RETRIES})")
+                await asyncio.sleep(wait_time)
+                return await lock_batch(session, agent_id, retry_count + 1)
             else:
-                logger.error(f"API Error {resp.status}: {await resp.text()}")
+                error_text = await resp.text()
+                # Only log detailed error if enabled
+                if LOG_502_DETAILS or resp.status != 502:
+                    logger.error(f"API Error {resp.status} for Agent {agent_id}: {error_text[:200]}")
+                else:
+                    logger.error(f"API Error {resp.status} for Agent {agent_id} - Server unavailable")
+    except asyncio.TimeoutError:
+        logger.error(f"⏱️ Timeout locking batch for Agent {agent_id}")
     except Exception as e:
-        logger.error(f"Lock Batch Exception: {e}")
+        logger.error(f"❌ Lock Batch Exception for Agent {agent_id}: {e}")
     return []
 
-async def release_batch(session, agent_id):
-    """Release the batch for an agent after processing"""
+async def release_batch(session, agent_id, retry_count=0):
+    """Release the batch for an agent after processing with retry logic"""
     url = f"{BASE_URL}/admin/kyc-release-batch"
     payload = {
         "admin_id": ADMIN_ID,
@@ -255,14 +277,25 @@ async def release_batch(session, agent_id):
                     return True
                 else:
                     logger.error(f"Failed to release batch for Agent {agent_id}: {data.get('message')}")
+            elif resp.status == 502 and retry_count < MAX_RETRIES:
+                wait_time = 2 ** retry_count * INITIAL_RETRY_DELAY
+                logger.warning(f"⚠️ 502 Bad Gateway releasing batch for Agent {agent_id}. Retrying in {wait_time}s... (Attempt {retry_count + 1}/{MAX_RETRIES})")
+                await asyncio.sleep(wait_time)
+                return await release_batch(session, agent_id, retry_count + 1)
             else:
-                logger.error(f"Release Batch API Error {resp.status}: {await resp.text()}")
+                error_text = await resp.text()
+                if LOG_502_DETAILS or resp.status != 502:
+                    logger.error(f"Release Batch API Error {resp.status} for Agent {agent_id}: {error_text[:200]}")
+                else:
+                    logger.error(f"Release Batch API Error {resp.status} for Agent {agent_id} - Server unavailable")
+    except asyncio.TimeoutError:
+        logger.error(f"⏱️ Timeout releasing batch for Agent {agent_id}")
     except Exception as e:
-        logger.error(f"Release Batch Exception for Agent {agent_id}: {e}")
+        logger.error(f"❌ Release Batch Exception for Agent {agent_id}: {e}")
     return False
 
-async def fetch_user_details(session, agent_id):
-    """Step 2: Get details for the assigned users"""
+async def fetch_user_details(session, agent_id, retry_count=0):
+    """Step 2: Get details for the assigned users with retry logic"""
     url = f"{BASE_URL}/admin/verify-list"
     payload = {
         "admin_id": agent_id, 
@@ -280,12 +313,23 @@ async def fetch_user_details(session, agent_id):
             if resp.status == 200:
                 data = await resp.json()
                 users = data.get("data", [])
-                logger.info(f" Fetched details for {len(users)} users")
+                logger.info(f"📋 Fetched details for {len(users)} users (Agent {agent_id})")
                 return users
+            elif resp.status == 502 and retry_count < MAX_RETRIES:
+                wait_time = 2 ** retry_count * INITIAL_RETRY_DELAY
+                logger.warning(f"⚠️ 502 Bad Gateway fetching users for Agent {agent_id}. Retrying in {wait_time}s... (Attempt {retry_count + 1}/{MAX_RETRIES})")
+                await asyncio.sleep(wait_time)
+                return await fetch_user_details(session, agent_id, retry_count + 1)
             else:
-                logger.error(f"Fetch Details Error {resp.status}: {await resp.text()}")
+                error_text = await resp.text()
+                if LOG_502_DETAILS or resp.status != 502:
+                    logger.error(f"Fetch Details Error {resp.status} for Agent {agent_id}: {error_text[:200]}")
+                else:
+                    logger.error(f"Fetch Details Error {resp.status} for Agent {agent_id} - Server unavailable")
+    except asyncio.TimeoutError:
+        logger.error(f"⏱️ Timeout fetching user details for Agent {agent_id}")
     except Exception as e:
-        logger.error(f"Fetch Details Exception: {e}")
+        logger.error(f"❌ Fetch Details Exception for Agent {agent_id}: {e}")
     return []
 
 async def process_single_user(session, user, session_dir, agent_id):
@@ -581,13 +625,13 @@ async def process_single_user(session, user, session_dir, agent_id):
 
 async def process_agent_batch(session, agent_id, session_dir):
     """Process a single batch for a specific agent"""
-    logger.info(f"--- Starting Cycle for Agent {agent_id} ---")
+    logger.info(f"🔄 --- Starting Cycle for Agent {agent_id} ---")
     
     # 1. Lock Batch
     locked_ids = await lock_batch(session, agent_id)
     
     if not locked_ids:
-        logger.info(f"No users available to lock for Agent {agent_id}")
+        logger.warning(f"⚠️ No users available to lock for Agent {agent_id} (Server may be down or no pending users)")
         return False
     
     # 2. Fetch User Details
@@ -684,14 +728,14 @@ async def run_pipeline():
                     processed = await process_agent_batch(session, agent_id, session_dir)
                     
                     if not processed:
-                        logger.info(f"No work available for Agent {agent_id}, moving to next agent...")
+                        logger.info(f"⏭️ No work available for Agent {agent_id}, moving to next agent...")
                     
-                    # Small delay between agents
-                    await asyncio.sleep(1)
+                    # Delay between agents to avoid rate limiting
+                    await asyncio.sleep(AGENT_CYCLE_DELAY)
                 
-                # After processing all agents, take a short break before the next cycle
-                logger.info("--- Completed cycle for all agents. Starting next cycle in 5s... ---")
-                await asyncio.sleep(5)
+                # After processing all agents, take a longer break before the next cycle
+                logger.info(f"--- Completed cycle for all agents. Starting next cycle in {FULL_CYCLE_DELAY}s... ---")
+                await asyncio.sleep(FULL_CYCLE_DELAY)
                 
         except KeyboardInterrupt:
             logger.info("🛑 Shutdown requested...")

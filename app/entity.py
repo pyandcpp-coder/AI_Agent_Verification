@@ -651,21 +651,22 @@ class EntityAgent:
         """
         Try multiple OCR methods specifically for Aadhaar numbers.
         Tries ALL 4 rotations for EACH preprocessing method.
+        Returns the RAW OCR text (preserving X's for masked detection).
         """
         try:
             preprocessed_versions = self._preprocess_for_aadhaar_ocr(img)
             
             # Try different PSM modes and configurations
             configs = [
-                '--psm 7 -c tessedit_char_whitelist=0123456789',  # Single line, digits only
-                '--psm 8 -c tessedit_char_whitelist=0123456789',  # Single word, digits only
-                '--psm 6 -c tessedit_char_whitelist=0123456789',  # Block of text, digits only
-                '--psm 7',  # Single line, all chars
+                '--psm 7',  # Single line, all chars (preserve X's)
+                '--psm 8',  # Single word, all chars
+                '--psm 6',  # Block of text, all chars
+                '--psm 7 -c tessedit_char_whitelist=0123456789X',  # Include X for masked Aadhaar
                 '--psm 13',  # Raw line
             ]
             
             best_result = ""
-            best_digit_count = 0
+            best_score = 0
             
             # Try all 4 rotations for each preprocessing method
             for method_name, processed_img in preprocessed_versions:
@@ -684,29 +685,31 @@ class EntityAgent:
                         try:
                             from PIL import Image
                             pil_img = Image.fromarray(rotated_img)
-                            text = pytesseract.image_to_string(pil_img, lang='eng', config=config)
+                            text = pytesseract.image_to_string(pil_img, lang='eng', config=config).strip()
                             
-                            # Extract digits only
-                            digits = re.sub(r'\D', '', text)
+                            # Keep original text (with X's if masked)
+                            # Score based on: length of valid chars (digits or X) + pattern matching
+                            valid_chars = re.findall(r'[0-9X]', text, re.IGNORECASE)
+                            score = len(valid_chars)
                             
-                            logger.debug(f"    Method: {method_name}, Rotation: {rotation}°, Config: {config[:20]}, Result: {digits}")
+                            logger.debug(f"    Method: {method_name}, Rotation: {rotation}°, Config: {config[:20]}, Result: {text}, Score: {score}")
                             
-                            # Keep track of best result (most digits found)
-                            if len(digits) > best_digit_count:
-                                best_digit_count = len(digits)
-                                best_result = digits
-                                logger.info(f"    Better result found: {digits} (method: {method_name}, rotation: {rotation}°)")
+                            # Keep track of best result
+                            if score > best_score:
+                                best_score = score
+                                best_result = text
+                                logger.info(f"    Better result found: {text} (method: {method_name}, rotation: {rotation}°, score: {score})")
                             
-                            # If we got 12 digits, we're done!
-                            if len(digits) == 12:
-                                logger.info(f"    Perfect Aadhaar found: {digits} (method: {method_name}, rotation: {rotation}°)")
-                                return digits
+                            # If we got 12 chars (digits or X's), we likely have the full Aadhaar
+                            if score >= 12:
+                                logger.info(f"    Complete Aadhaar found: {text} (method: {method_name}, rotation: {rotation}°)")
+                                return text
                                 
                         except Exception as e:
                             logger.debug(f"    OCR attempt failed: {e}")
                             continue
             
-            logger.info(f"    Best Aadhaar result: {best_result} ({best_digit_count} digits)")
+            logger.info(f"    Best Aadhaar result: {best_result} (score: {best_score})")
             return best_result
             
         except Exception as e:
@@ -1018,15 +1021,38 @@ class EntityAgent:
                 for field in fields:
                     if field in card['entities'] and card['entities'][field]:
                         all_texts = [item.get('extracted_text', '') for item in card['entities'][field]]
-                        first_valid_text = next((text for text in all_texts if text), '')
                         
-                        if first_valid_text:
-                            if field == 'aadharnumber':
+                        if field == 'aadharnumber':
+                            first_valid_text = next((text for text in all_texts if text), '')
+                            if first_valid_text:
                                 if side == 'front':
                                     aadhar_front = first_valid_text
                                 elif side == 'back':
                                     aadhar_back = first_valid_text
-                            else:
+                        elif field == 'dob':
+                            # For DOB, pick the one that contains a valid 4-digit year
+                            best_dob = data.get('dob', '')
+                            for text in all_texts:
+                                if text:
+                                    # Check if this text contains a 4-digit year
+                                    digit_groups = re.findall(r'\d+', text)
+                                    has_valid_year = any(
+                                        len(g) == 4 and 1900 <= int(g) <= datetime.now().year 
+                                        for g in digit_groups
+                                    )
+                                    if has_valid_year:
+                                        logger.info(f"  Found DOB with valid year: '{text}'")
+                                        data[field] = text
+                                        break  # Use the first one with a valid year
+                            # If no valid year found, use first non-empty text
+                            if not data.get('dob'):
+                                first_valid_text = next((text for text in all_texts if text), '')
+                                if first_valid_text:
+                                    data[field] = first_valid_text
+                        else:
+                            # For other fields (like gender), use first valid text
+                            first_valid_text = next((text for text in all_texts if text), '')
+                            if first_valid_text:
                                 data[field] = first_valid_text
         
         # --- Special Logic for Aadhar Number from Front & Back ---
@@ -1066,25 +1092,40 @@ class EntityAgent:
         
         # --- Aadhaar Number Validation ---
         aadhar_status = "aadhar_approved"
-        if data.get('aadharnumber'):
+        aadhar_rejection_reason = None
+        
+        # FIRST: Check for masked Aadhaar (with X's) in ORIGINAL OCR text
+        is_masked = False
+        if (aadhar_front and re.search(r'X{2,}', aadhar_front, re.IGNORECASE)) or \
+           (aadhar_back and re.search(r'X{2,}', aadhar_back, re.IGNORECASE)):
+            is_masked = True
+            aadhar_status = "aadhar_disapproved"
+            aadhar_rejection_reason = "masked_aadhar"
+            logger.warning(f"❌ MASKED AADHAAR DETECTED: Front='{aadhar_front}', Back='{aadhar_back}'")
+        
+        if not is_masked and data.get('aadharnumber'):
             aad = data['aadharnumber']
             # Extract only digits, remove all spaces and special characters
             aad_digits_only = re.sub(r'\D', '', aad)  # Remove all non-digit characters
             
-            # Check for masked Aadhaar (with X's) in original text
-            if (aadhar_front and re.search(r'X{4}', aadhar_front, re.IGNORECASE)) or \
-               (aadhar_back and re.search(r'X{4}', aadhar_back, re.IGNORECASE)):
-                aadhar_status = "aadhar_disapproved"
             # Validate that we have exactly 12 digits
-            elif len(aad_digits_only) == 12:
+            if len(aad_digits_only) == 12:
                 data['aadharnumber'] = aad_digits_only
+                logger.info(f"✓ Valid Aadhaar number: {aad_digits_only}")
             else:
                 # If not exactly 12 digits, disapprove
                 aadhar_status = "aadhar_disapproved"
+                aadhar_rejection_reason = "invalid_length"
                 data['aadharnumber'] = aad_digits_only  # Store what we got anyway
-        else:
+                logger.warning(f"❌ Invalid Aadhaar length: {len(aad_digits_only)} digits (expected 12)")
+        elif not is_masked:
             aadhar_status = "aadhar_disapproved"
+            aadhar_rejection_reason = "not_detected"
+            logger.warning("❌ Aadhaar number not detected")
+        
         data['aadhar_status'] = aadhar_status
+        if aadhar_rejection_reason:
+            data['aadhar_rejection_reason'] = aadhar_rejection_reason
         
         # --- DOB Processing and Age Verification (Year-based only) ---
         age_status = "age_disapproved"
