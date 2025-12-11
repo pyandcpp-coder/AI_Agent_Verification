@@ -36,24 +36,82 @@ doc_agent = None
 entity_agent = None
 gender_pipeline = None
 scorer = None
+http_session = None  # Reusable aiohttp session
 
 TEMP_DIR = Path("temp")
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize all heavy models once at startup to save RAM/Time."""
-    global face_agent, doc_agent, entity_agent, gender_pipeline, scorer
+    global face_agent, doc_agent, entity_agent, gender_pipeline, scorer, http_session
     
     # Create temp dir if not exists
     TEMP_DIR.mkdir(exist_ok=True)
 
     print("--- STARTING SYSTEM INITIALIZATION ---")
+    
+    # Create persistent HTTP session with connection limits
+    connector = aiohttp.TCPConnector(
+        limit=100,  # Max total connections
+        limit_per_host=30,  # Max connections per host
+        ttl_dns_cache=300,  # DNS cache timeout
+        force_close=True  # Force close connections after each request
+    )
+    http_session = aiohttp.ClientSession(connector=connector)
+    
     face_agent = FaceAgent()        # Loads InsightFace (Face + Gender)
     doc_agent = DocAgent()          # Loads YOLO for Doc Detection
     entity_agent = EntityAgent()    # Loads YOLO for Entities + Tesseract
     gender_pipeline = GenderPipeline() # Loads Specialized Gender Pipeline
     scorer = VerificationScorer()   # Loads Scoring Logic
+    
+    # Start background cleanup task
+    asyncio.create_task(periodic_cleanup())
+    
     print("--- SYSTEM READY ---")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup resources on shutdown."""
+    global http_session
+    if http_session:
+        await http_session.close()
+    print("--- SYSTEM SHUTDOWN ---")
+
+async def periodic_cleanup():
+    """Background task to clean up old temp directories every 5 minutes."""
+    import time
+    while True:
+        try:
+            await asyncio.sleep(300)  # Run every 5 minutes
+            
+            if not TEMP_DIR.exists():
+                continue
+            
+            current_time = time.time()
+            cleaned_count = 0
+            
+            # Delete directories older than 10 minutes
+            for user_dir in TEMP_DIR.iterdir():
+                if not user_dir.is_dir():
+                    continue
+                
+                # Check directory age
+                dir_age = current_time - user_dir.stat().st_mtime
+                if dir_age > 600:  # 10 minutes
+                    try:
+                        import gc
+                        gc.collect()
+                        shutil.rmtree(user_dir, ignore_errors=True)
+                        cleaned_count += 1
+                    except Exception as e:
+                        print(f"Periodic cleanup failed for {user_dir}: {e}")
+            
+            if cleaned_count > 0:
+                print(f"Periodic cleanup: Removed {cleaned_count} old temp directories")
+                
+        except Exception as e:
+            print(f"Error in periodic cleanup: {e}")
 
 # --- INPUT MODEL MATCHING YOUR SPECIFIC JSON FORMAT ---
 class VerifyRequest(BaseModel):
@@ -122,7 +180,27 @@ async def setup_files(user_id: str, req: VerifyRequest):
     
     # Clean existing directory if it exists to ensure fresh start
     if task_dir.exists():
-        shutil.rmtree(task_dir)
+        try:
+            # Force close any open file handles before deletion
+            import gc
+            gc.collect()  # Force garbage collection to close file handles
+            
+            # Use ignore_errors for more robust cleanup
+            shutil.rmtree(task_dir, ignore_errors=True)
+            
+            # If still exists, try manual deletion
+            if task_dir.exists():
+                for item in task_dir.rglob('*'):
+                    try:
+                        if item.is_file():
+                            item.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                task_dir.rmdir()
+        except Exception as e:
+            print(f"Warning: Could not fully clean {task_dir}: {e}")
+            # Continue anyway - will overwrite files
+    
     task_dir.mkdir(parents=True, exist_ok=True)
 
     # Define standard filenames for internal processing
@@ -133,13 +211,14 @@ async def setup_files(user_id: str, req: VerifyRequest):
         "back": task_dir / f"{user_id}_aadhar_back.jpg"
     }
 
-    async with aiohttp.ClientSession() as session:
-        # Fetch all 3 concurrently
-        results = await asyncio.gather(
-            fetch_file(session, req.selfie_photo, paths["selfie"]),
-            fetch_file(session, req.passport_first, paths["front"]),
-            fetch_file(session, req.passport_old, paths["back"])
-        )
+    # Use the global session instead of creating new ones
+    global http_session
+    # Fetch all 3 concurrently
+    results = await asyncio.gather(
+        fetch_file(http_session, req.selfie_photo, paths["selfie"]),
+        fetch_file(http_session, req.passport_first, paths["front"]),
+        fetch_file(http_session, req.passport_old, paths["back"])
+    )
 
     # Check if all files were successfully retrieved
     if all(results):
@@ -147,7 +226,10 @@ async def setup_files(user_id: str, req: VerifyRequest):
         return {k: str(v) for k, v in paths.items()}, task_dir
     else:
         # Cleanup immediately if any file failed
-        shutil.rmtree(task_dir)
+        try:
+            shutil.rmtree(task_dir, ignore_errors=True)
+        except Exception:
+            pass
         return None, None
 
 @app.post("/verification/verify")
@@ -308,7 +390,26 @@ async def verify_user(req: VerifyRequest):
         # Always delete the temp folder for this user after processing
         if task_dir and task_dir.exists():
             try:
-                shutil.rmtree(task_dir)
+                # Force garbage collection to release file handles
+                import gc
+                gc.collect()
+                
+                # Use ignore_errors for robust cleanup
+                shutil.rmtree(task_dir, ignore_errors=True)
+                
+                # If still exists, force delete files individually
+                if task_dir.exists():
+                    for item in task_dir.rglob('*'):
+                        try:
+                            if item.is_file():
+                                item.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                    try:
+                        task_dir.rmdir()
+                    except Exception:
+                        pass
+                
                 print(f"[{user_id}] Cleanup Complete")
             except Exception as e:
                 print(f"[{user_id}] Cleanup Failed: {e}")
@@ -467,7 +568,26 @@ async def verify_user_production(req: VerifyRequest):
         # 6. Cleanup
         if task_dir and task_dir.exists():
             try:
-                shutil.rmtree(task_dir)
+                # Force garbage collection to release file handles
+                import gc
+                gc.collect()
+                
+                # Use ignore_errors for robust cleanup
+                shutil.rmtree(task_dir, ignore_errors=True)
+                
+                # If still exists, force delete files individually
+                if task_dir.exists():
+                    for item in task_dir.rglob('*'):
+                        try:
+                            if item.is_file():
+                                item.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                    try:
+                        task_dir.rmdir()
+                    except Exception:
+                        pass
+                
                 print(f"[{user_id}] Cleanup Complete")
             except Exception as e:
                 print(f"[{user_id}] Cleanup Failed: {e}")

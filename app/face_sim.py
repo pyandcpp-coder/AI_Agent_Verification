@@ -51,4 +51,3 @@ class FaceAgent:
             'score': float(max(0, min(100, score))),
             'source': 'face_agent'
         }
-    
