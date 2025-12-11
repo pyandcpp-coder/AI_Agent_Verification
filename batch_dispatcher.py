@@ -410,7 +410,7 @@ async def fetch_user_details(session, agent_id, retry_count=0):
     payload = {
         "admin_id": agent_id, 
         "page": 1,
-        "only_pending": true,
+        "only_pending": True,
         "limit": BATCH_SIZE,
         "statusFilter": "2",  
         "isFullSearch": True,
