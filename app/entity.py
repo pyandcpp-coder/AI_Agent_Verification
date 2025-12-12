@@ -1008,7 +1008,7 @@ class EntityAgent:
         return organized_results
 
     def extract_main_fields(self, organized_results: Dict[str, Any]) -> Dict[str, Any]:
-        """Your EXACT original Validation Logic (Moved inside class)"""
+        """Extract and validate main fields with strict masked Aadhaar rejection"""
         fields = ['aadharnumber', 'dob', 'gender']
         data = {key: "" for key in fields}
         
@@ -1055,77 +1055,101 @@ class EntityAgent:
                             if first_valid_text:
                                 data[field] = first_valid_text
         
-        # --- Special Logic for Aadhar Number from Front & Back ---
-        best_aadhar = ""
-        aadhar_front_digits = re.sub(r'\D', '', aadhar_front) if aadhar_front else ""
-        aadhar_back_digits = re.sub(r'\D', '', aadhar_back) if aadhar_back else ""
+        # --- CRITICAL: Check for Masked Aadhaar FIRST (Before any processing) ---
+        logger.info("=" * 60)   
+        logger.info("🔍 CHECKING FOR MASKED AADHAAR")
+        logger.info("=" * 60)
+        logger.info(f"Aadhar Front (RAW): '{aadhar_front}'")
+        logger.info(f"Aadhar Back (RAW): '{aadhar_back}'")
         
-        logger.info(f"Aadhar Front: '{aadhar_front}' -> Digits: '{aadhar_front_digits}'")
-        logger.info(f"Aadhar Back: '{aadhar_back}' -> Digits: '{aadhar_back_digits}'")
-        
-        if aadhar_front_digits == aadhar_back_digits and aadhar_front_digits:
-            # Both match - use this
-            logger.info(f"Aadhar match between front and back: {aadhar_front_digits}")
-            best_aadhar = aadhar_front_digits
-        else:
-            # Different values - prefer the one with all 12 digits, or the one with more digits
-            if len(aadhar_front_digits) == 12:
-                logger.info(f"Using Aadhar from front (complete 12 digits): {aadhar_front_digits}")
-                best_aadhar = aadhar_front_digits
-            elif len(aadhar_back_digits) == 12:
-                logger.info(f"Using Aadhar from back (complete 12 digits): {aadhar_back_digits}")
-                best_aadhar = aadhar_back_digits
-            elif len(aadhar_front_digits) > len(aadhar_back_digits):
-                logger.info(f"Using Aadhar from front (more digits): {aadhar_front_digits}")
-                best_aadhar = aadhar_front_digits
-            elif len(aadhar_back_digits) > len(aadhar_front_digits):
-                logger.info(f"Using Aadhar from back (more digits): {aadhar_back_digits}")
-                best_aadhar = aadhar_back_digits
-            elif aadhar_front_digits:
-                logger.info(f"Using Aadhar from front (fallback): {aadhar_front_digits}")
-                best_aadhar = aadhar_front_digits
-            elif aadhar_back_digits:
-                logger.info(f"Using Aadhar from back (fallback): {aadhar_back_digits}")
-                best_aadhar = aadhar_back_digits
-        
-        data['aadharnumber'] = best_aadhar
-        
-        # --- Aadhaar Number Validation ---
-        aadhar_status = "aadhar_approved"
-        aadhar_rejection_reason = None
-        
-        # FIRST: Check for masked Aadhaar (with X's) in ORIGINAL OCR text
         is_masked = False
-        if (aadhar_front and re.search(r'X{2,}', aadhar_front, re.IGNORECASE)) or \
-           (aadhar_back and re.search(r'X{2,}', aadhar_back, re.IGNORECASE)):
+        masked_source = None
+        
+        # Check for ANY occurrence of 'X' (case-insensitive) in the RAW OCR text
+        if aadhar_front and 'X' in aadhar_front.upper():
             is_masked = True
-            aadhar_status = "aadhar_disapproved"
-            aadhar_rejection_reason = "masked_aadhar"
-            logger.warning(f"❌ MASKED AADHAAR DETECTED: Front='{aadhar_front}', Back='{aadhar_back}'")
+            masked_source = 'front'
+            logger.warning(f"❌ MASKED AADHAAR DETECTED IN FRONT: '{aadhar_front}'")
         
-        if not is_masked and data.get('aadharnumber'):
-            aad = data['aadharnumber']
-            # Extract only digits, remove all spaces and special characters
-            aad_digits_only = re.sub(r'\D', '', aad)  # Remove all non-digit characters
+        if aadhar_back and 'X' in aadhar_back.upper():
+            is_masked = True
+            masked_source = 'back' if not masked_source else 'both'
+            logger.warning(f"❌ MASKED AADHAAR DETECTED IN BACK: '{aadhar_back}'")
+        
+        # If masked Aadhaar detected, REJECT immediately
+        if is_masked:
+            logger.error(f"🚫 REJECTING USER: Masked Aadhaar detected in {masked_source}")
+            data['aadharnumber'] = aadhar_front if aadhar_front else aadhar_back  # Store the masked value
+            data['aadhar_status'] = "aadhar_disapproved"
+            data['aadhar_rejection_reason'] = "masked_aadhar"
             
-            # Validate that we have exactly 12 digits
-            if len(aad_digits_only) == 12:
-                data['aadharnumber'] = aad_digits_only
-                logger.info(f"✓ Valid Aadhaar number: {aad_digits_only}")
+            # Still process DOB and gender for completeness, but Aadhaar is rejected
+            # Continue with rest of the processing below
+        else:
+            logger.info("✓ No masking detected, proceeding with Aadhaar validation")
+            
+            # --- Only process Aadhaar if NOT masked ---
+            best_aadhar = ""
+            aadhar_front_digits = re.sub(r'\D', '', aadhar_front) if aadhar_front else ""
+            aadhar_back_digits = re.sub(r'\D', '', aadhar_back) if aadhar_back else ""
+            
+            logger.info(f"Aadhar Front Digits: '{aadhar_front_digits}'")
+            logger.info(f"Aadhar Back Digits: '{aadhar_back_digits}'")
+            
+            if aadhar_front_digits == aadhar_back_digits and aadhar_front_digits:
+                # Both match - use this
+                logger.info(f"✓ Aadhar match between front and back: {aadhar_front_digits}")
+                best_aadhar = aadhar_front_digits
             else:
-                # If not exactly 12 digits, disapprove
+                # Different values - prefer the one with all 12 digits, or the one with more digits
+                if len(aadhar_front_digits) == 12:
+                    logger.info(f"✓ Using Aadhar from front (complete 12 digits): {aadhar_front_digits}")
+                    best_aadhar = aadhar_front_digits
+                elif len(aadhar_back_digits) == 12:
+                    logger.info(f"✓ Using Aadhar from back (complete 12 digits): {aadhar_back_digits}")
+                    best_aadhar = aadhar_back_digits
+                elif len(aadhar_front_digits) > len(aadhar_back_digits):
+                    logger.info(f"Using Aadhar from front (more digits): {aadhar_front_digits}")
+                    best_aadhar = aadhar_front_digits
+                elif len(aadhar_back_digits) > len(aadhar_front_digits):
+                    logger.info(f"Using Aadhar from back (more digits): {aadhar_back_digits}")
+                    best_aadhar = aadhar_back_digits
+                elif aadhar_front_digits:
+                    logger.info(f"Using Aadhar from front (fallback): {aadhar_front_digits}")
+                    best_aadhar = aadhar_front_digits
+                elif aadhar_back_digits:
+                    logger.info(f"Using Aadhar from back (fallback): {aadhar_back_digits}")
+                    best_aadhar = aadhar_back_digits
+            
+            data['aadharnumber'] = best_aadhar
+            
+            # --- Aadhaar Number Validation (only if not masked) ---
+            aadhar_status = "aadhar_approved"
+            aadhar_rejection_reason = None
+            
+            if data.get('aadharnumber'):
+                aad = data['aadharnumber']
+                # Extract only digits, remove all spaces and special characters
+                aad_digits_only = re.sub(r'\D', '', aad)
+                
+                # Validate that we have exactly 12 digits
+                if len(aad_digits_only) == 12:
+                    data['aadharnumber'] = aad_digits_only
+                    logger.info(f"✓ Valid Aadhaar number: {aad_digits_only}")
+                else:
+                    # If not exactly 12 digits, disapprove
+                    aadhar_status = "aadhar_disapproved"
+                    aadhar_rejection_reason = "invalid_length"
+                    data['aadharnumber'] = aad_digits_only  # Store what we got anyway
+                    logger.warning(f"❌ Invalid Aadhaar length: {len(aad_digits_only)} digits (expected 12)")
+            else:
                 aadhar_status = "aadhar_disapproved"
-                aadhar_rejection_reason = "invalid_length"
-                data['aadharnumber'] = aad_digits_only  # Store what we got anyway
-                logger.warning(f"❌ Invalid Aadhaar length: {len(aad_digits_only)} digits (expected 12)")
-        elif not is_masked:
-            aadhar_status = "aadhar_disapproved"
-            aadhar_rejection_reason = "not_detected"
-            logger.warning("❌ Aadhaar number not detected")
-        
-        data['aadhar_status'] = aadhar_status
-        if aadhar_rejection_reason:
-            data['aadhar_rejection_reason'] = aadhar_rejection_reason
+                aadhar_rejection_reason = "not_detected"
+                logger.warning("❌ Aadhaar number not detected")
+            
+            data['aadhar_status'] = aadhar_status
+            if aadhar_rejection_reason:
+                data['aadhar_rejection_reason'] = aadhar_rejection_reason
         
         # --- DOB Processing and Age Verification (Year-based only) ---
         age_status = "age_disapproved"
@@ -1151,9 +1175,9 @@ class EntityAgent:
                     # Approve if age >= 18
                     if age >= 18:
                         age_status = "age_approved"
-                        logger.info(f"Age approved: {age} years old (born in {birth_year})")
+                        logger.info(f"✓ Age approved: {age} years old (born in {birth_year})")
                     else:
-                        logger.info(f"Age rejected: {age} years old (born in {birth_year})")
+                        logger.info(f"❌ Age rejected: {age} years old (born in {birth_year})")
                 except ValueError:
                     data['dob'] = 'Invalid Format'
                     data['age'] = None
@@ -1190,6 +1214,20 @@ class EntityAgent:
                 data['gender'] = 'Other'
         else:
             data['gender'] = 'Not Detected'
+        
+        # Final summary log
+        logger.info("\n" + "=" * 60)
+        logger.info("📋 FINAL VALIDATION SUMMARY")
+        logger.info("=" * 60)
+        logger.info(f"Aadhaar Number: {data.get('aadharnumber', 'N/A')}")
+        logger.info(f"Aadhaar Status: {data.get('aadhar_status', 'N/A')}")
+        if data.get('aadhar_rejection_reason'):
+            logger.info(f"Rejection Reason: {data.get('aadhar_rejection_reason')}")
+        logger.info(f"DOB: {data.get('dob', 'N/A')}")
+        logger.info(f"Age: {data.get('age', 'N/A')}")
+        logger.info(f"Age Status: {data.get('age_status', 'N/A')}")
+        logger.info(f"Gender: {data.get('gender', 'N/A')}")
+        logger.info("=" * 60)
             
         return data
 
