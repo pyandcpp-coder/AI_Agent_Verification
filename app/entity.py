@@ -15,6 +15,9 @@ import torch
 from dotenv import load_dotenv
 from ultralytics import YOLO
 
+# Import Qwen fallback
+from app.qwen_fallback import QwenFallbackAgent
+
 # Load environment variables
 load_dotenv()
 
@@ -23,7 +26,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class EntityAgent:
-    def __init__(self, model_path="models/best.pt", other_lang_code='hin+tel+ben', save_debug_images=True):
+    def __init__(self, model_path="models/best.pt", other_lang_code='hin+tel+ben', 
+                 save_debug_images=True, enable_qwen_fallback=True):
 
         if torch.cuda.is_available():
             self.device = "cuda"
@@ -35,12 +39,6 @@ class EntityAgent:
         # --- Model Loading ---
         self.entity_model_path = model_path
         self.save_debug_images = save_debug_images
-        
-        # Create debug output directories
-        # if self.save_debug_images:
-        #     self.debug_base_dir = Path("debug_output")
-        #     self.debug_base_dir.mkdir(exist_ok=True)
-        #     logger.info(f"Debug images will be saved to: {self.debug_base_dir}")
         
         logger.info("Checking for entity detection YOLO model on filesystem...")
         if not Path(self.entity_model_path).exists():
@@ -61,6 +59,20 @@ class EntityAgent:
             4: 'dob', 5: 'gender', 6: 'gender_other_lang', 7: 'mobile_no',
             8: 'name', 9: 'name_otherlang', 10: 'pincode'
         }
+        
+        # Initialize Qwen fallback agent
+        self.enable_qwen_fallback = enable_qwen_fallback
+        self.qwen_agent = None
+        
+        if self.enable_qwen_fallback:
+            try:
+                logger.info("Initializing Qwen3-VL fallback agent...")
+                self.qwen_agent = QwenFallbackAgent()
+                logger.info("✅ Qwen3-VL fallback agent ready")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not initialize Qwen fallback: {e}")
+                logger.warning("Continuing without Qwen fallback support")
+                self.enable_qwen_fallback = False
 
     def _check_tesseract(self):
         try:
@@ -71,6 +83,47 @@ class EntityAgent:
         except Exception as e:
              logger.critical(f"An error occurred while checking Tesseract: {e}")
              raise RuntimeError(f"Error checking Tesseract: {e}")
+
+    def _is_masked_aadhaar(self, text: str) -> bool:
+        """
+        Enhanced masked Aadhaar detection with multiple checks.
+        
+        Returns True if the Aadhaar is masked (contains X's).
+        """
+        if not text:
+            return False
+        
+        text_upper = str(text).upper()
+        
+        # Check 1: Direct presence of 'X' character
+        if 'X' in text_upper:
+            logger.warning(f"🚫 MASKED AADHAAR DETECTED (contains X): '{text}'")
+            return True
+        
+        # Check 2: Pattern matching for common masked formats
+        # XXXX XXXX 1234, XXXXXXXX1234, etc.
+        masked_patterns = [
+            r'X{4,}',  # 4 or more X's in a row
+            r'[X\s-]{8,}[0-9]{4}',  # 8+ chars of X/space/dash followed by 4 digits
+            r'[0-9X\s-]*X{2,}[0-9X\s-]*',  # Any sequence containing 2+ X's
+        ]
+        
+        for pattern in masked_patterns:
+            if re.search(pattern, text_upper):
+                logger.warning(f"🚫 MASKED AADHAAR DETECTED (pattern match): '{text}'")
+                return True
+        
+        # Check 3: Look for common masked Aadhaar indicators
+        # Sometimes OCR might read 'X' as similar characters
+        suspicious_chars = ['×', 'x', 'X', '*', '×']
+        text_clean = text.replace(' ', '').replace('-', '')
+        
+        suspicious_count = sum(text_clean.count(char) for char in suspicious_chars)
+        if suspicious_count >= 4:  # If 4+ suspicious characters
+            logger.warning(f"🚫 MASKED AADHAAR DETECTED (suspicious chars): '{text}'")
+            return True
+        
+        return False
 
     def _detect_card_rotation(self, img: np.ndarray, session_dir: Path = None) -> int:
         """
@@ -154,68 +207,7 @@ class EntityAgent:
         
         logger.info(f"✓ Best card rotation: {best_rotation}° (score: {best_score:.3f})")
         
-        # Save visualization if debug enabled
-        # if self.save_debug_images and session_dir:
-        #     self._save_rotation_comparison(img, rotation_details, best_rotation, session_dir)
-        
         return best_rotation
-
-    def _save_rotation_comparison(self, img: np.ndarray, rotation_details: dict, 
-                                   best_rotation: int, session_dir: Path):
-        """Create a comparison visualization of all 4 rotations."""
-        try:
-            comparisons = []
-            
-            for angle in [0, 90, 180, 270]:
-                # Rotate image
-                if angle == 0:
-                    rotated = img.copy()
-                elif angle == 90:
-                    rotated = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                elif angle == 180:
-                    rotated = cv2.rotate(img, cv2.ROTATE_180)
-                elif angle == 270:
-                    rotated = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
-                
-                # Resize to consistent size for comparison
-                h, w = rotated.shape[:2]
-                if h > 600:
-                    scale = 600 / h
-                    new_w, new_h = int(w * scale), 600
-                    rotated = cv2.resize(rotated, (new_w, new_h))
-                
-                # Add info text
-                details = rotation_details[angle]
-                is_best = angle == best_rotation
-                color = (0, 255, 0) if is_best else (255, 255, 255)
-                thickness = 3 if is_best else 2
-                
-                cv2.putText(rotated, f"{angle} degrees", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, color, thickness)
-                cv2.putText(rotated, f"Entities: {details['num_entities']}", (10, 60),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-                cv2.putText(rotated, f"Conf: {details['avg_confidence']:.2f}", (10, 90),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-                
-                if is_best:
-                    cv2.rectangle(rotated, (0, 0), (rotated.shape[1]-1, rotated.shape[0]-1),
-                                 (0, 255, 0), 5)
-                    cv2.putText(rotated, "BEST", (10, 120),
-                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
-                
-                comparisons.append(rotated)
-            
-            # Create 2x2 grid
-            top_row = np.hstack([comparisons[0], comparisons[1]])
-            bottom_row = np.hstack([comparisons[2], comparisons[3]])
-            grid = np.vstack([top_row, bottom_row])
-            
-            # rotation_path = session_dir / "00_card_rotation_detection.jpg"
-            # cv2.imwrite(str(rotation_path), grid)
-            # logger.info(f"  Saved rotation comparison: {rotation_path}")
-            
-        except Exception as e:
-            logger.warning(f"  Could not save rotation comparison: {e}")
 
     def _check_critical_fields(self, final_data: Dict[str, Any], card_side: str) -> Dict[str, bool]:
         """
@@ -232,9 +224,10 @@ class EntityAgent:
             value = final_data.get(field, "")
             
             if field == 'aadharnumber':
-                # Check if valid 12-digit number
+                # Check if valid 12-digit number AND not masked
                 digits = re.sub(r'\D', '', str(value))
-                missing[field] = len(digits) != 12
+                is_masked = self._is_masked_aadhaar(str(value))
+                missing[field] = (len(digits) != 12) or is_masked
             elif field == 'dob':
                 # Check if not "Invalid Format" or "Not Detected"
                 missing[field] = value in ['Invalid Format', 'Not Detected', '', None]
@@ -266,11 +259,17 @@ class EntityAgent:
                     full_digits = re.sub(r'\D', '', str(full_value)) if full_value else ""
                     cropped_digits = re.sub(r'\D', '', str(cropped_value)) if cropped_value else ""
                     
-                    if len(full_digits) == 12 and len(cropped_digits) != 12:
+                    # Check for masking
+                    full_masked = self._is_masked_aadhaar(str(full_value))
+                    cropped_masked = self._is_masked_aadhaar(str(cropped_value))
+                    
+                    if not full_masked and len(full_digits) == 12 and (len(cropped_digits) != 12 or cropped_masked):
                         logger.info(f"  ✓ Using full image {field}: {full_digits}")
                         merged[field] = full_digits
-                        merged['aadhar_status'] = full_data.get('aadhar_status', 'aadhar_approved')
-                    elif len(full_digits) > len(cropped_digits):
+                        merged['aadhar_status'] = 'aadhar_approved'
+                        if 'aadhar_rejection_reason' in merged:
+                            del merged['aadhar_rejection_reason']
+                    elif len(full_digits) > len(cropped_digits) and not full_masked:
                         logger.info(f"  ✓ Using full image {field} (more digits): {full_digits}")
                         merged[field] = full_digits
                 
@@ -289,16 +288,17 @@ class EntityAgent:
     def extract_from_file(self, file_path: str, crop_coords: List[int] = None, 
                          confidence_threshold: float = 0.15, card_side: str = 'front'):
         """
-        Main Entry Point with CARD ROTATION DETECTION + FALLBACK mechanism.
+        Main Entry Point with CARD ROTATION DETECTION + FALLBACK mechanism + QWEN FALLBACK.
+        
+        Flow:
+        1. Detect card rotation
+        2. Try extraction with crop coordinates
+        3. If critical fields missing, try full image (2nd fallback)
+        4. If still missing/invalid, try Qwen VLM (3rd fallback)
         """
         try:
-            # Create session-specific debug directory
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             session_dir = None
-            # if self.save_debug_images:
-            #     session_dir = self.debug_base_dir / f"session_{timestamp}_{card_side}"
-            #     session_dir.mkdir(exist_ok=True)
-            #     logger.info(f"Session debug directory: {session_dir}")
             
             # 1. Read ORIGINAL Image
             original_img = cv2.imread(file_path)
@@ -311,19 +311,13 @@ class EntityAgent:
             
             # 3. Apply card rotation to original image
             if card_rotation != 0:
-                logger.info(f"📐 Applying card rotation: {card_rotation}°")
+                logger.info(f"🔄 Applying card rotation: {card_rotation}°")
                 if card_rotation == 90:
                     original_img = cv2.rotate(original_img, cv2.ROTATE_90_COUNTERCLOCKWISE)
                 elif card_rotation == 180:
                     original_img = cv2.rotate(original_img, cv2.ROTATE_180)
                 elif card_rotation == 270:
                     original_img = cv2.rotate(original_img, cv2.ROTATE_90_CLOCKWISE)
-                
-                # Save rotated image
-                # if self.save_debug_images and session_dir:
-                #     rotated_path = session_dir / f"00a_rotated_{card_rotation}deg.jpg"
-                #     cv2.imwrite(str(rotated_path), original_img)
-                #     logger.info(f"  Saved rotated image: {rotated_path}")
 
             # === ATTEMPT 1: Try with Crop Coordinates ===
             logger.info("=" * 60)
@@ -339,34 +333,17 @@ class EntityAgent:
                 
                 # IMPORTANT: Adjust crop coordinates if card was rotated
                 if card_rotation == 90:
-                    # When rotated 90° CCW: x,y swap and adjust
                     x1, y1, x2, y2 = y1, w - x2, y2, w - x1
                 elif card_rotation == 180:
-                    # When rotated 180°: flip both dimensions
                     x1, y1, x2, y2 = w - x2, h - y2, w - x1, h - y1
                 elif card_rotation == 270:
-                    # When rotated 270° (90° CW): x,y swap and adjust
                     x1, y1, x2, y2 = h - y2, x1, h - y1, x2
                 
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(w, x2), min(h, y2)
                 
                 logger.info(f"Cropping image to: [{x1}, {y1}, {x2}, {y2}] (after rotation adjustment)")
-                
-                # Save visualization of crop region
-                # if self.save_debug_images and session_dir:
-                #     img_with_crop_box = img.copy()
-                #     cv2.rectangle(img_with_crop_box, (x1, y1), (x2, y2), (255, 0, 0), 3)
-                #     cv2.putText(img_with_crop_box, f"Crop Region: {card_side}", (x1, y1-10),
-                #                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-                #     crop_box_path = session_dir / f"00b_crop_region_{card_side}.jpg"
-                #     cv2.imwrite(str(crop_box_path), img_with_crop_box)
-                
                 img = img[y1:y2, x1:x2]
-                
-                # if self.save_debug_images and session_dir:
-                #     input_path = session_dir / f"00c_cropped_input_{card_side}.jpg"
-                #     cv2.imwrite(str(input_path), img)
             else:
                 logger.info("No crop coordinates provided, using full image")
 
@@ -374,7 +351,7 @@ class EntityAgent:
             all_detections = self.detect_entities_in_image(img, confidence_threshold, card_side, session_dir)
             
             if not all_detections:
-                logger.warning("⚠️  No entities detected in cropped region")
+                logger.warning("⚠️ No entities detected in cropped region")
                 cropped_result = {
                     "success": False,
                     "message": "no_entities_detected",
@@ -399,8 +376,11 @@ class EntityAgent:
             missing_fields = self._check_critical_fields(cropped_result.get("data", {}), card_side)
             has_missing = any(missing_fields.values())
             
+            # Track which image to use for Qwen fallback
+            image_for_qwen = img  # Start with cropped image
+            
             if has_missing:
-                logger.warning("⚠️  CRITICAL FIELDS MISSING from cropped extraction:")
+                logger.warning("⚠️ CRITICAL FIELDS MISSING from cropped extraction:")
                 for field, is_missing in missing_fields.items():
                     if is_missing:
                         logger.warning(f"  ❌ {field}: Missing or Invalid")
@@ -410,18 +390,12 @@ class EntityAgent:
                 logger.info("🔄 ATTEMPT 2: FALLBACK - Running on FULL ORIGINAL image")
                 logger.info("=" * 60)
                 
-                # Run detection on FULL original image (already rotated)
                 full_detections = self.detect_entities_in_image(
                     original_img, confidence_threshold, card_side, session_dir
                 )
                 
                 if full_detections:
-                    # Create subfolder for full image results
-                    if session_dir:
-                        full_crops_dir = session_dir / "crops_fullimage"
-                        full_crops_dir.mkdir(exist_ok=True)
-                    else:
-                        full_crops_dir = None
+                    full_crops_dir = None
                     
                     self.crop_entities(full_detections, full_crops_dir)
                     full_ocr_results = self.perform_multi_language_ocr(full_detections)
@@ -441,29 +415,75 @@ class EntityAgent:
                         missing_fields
                     )
                     
-                    logger.info("\n✅ Final merged data:")
-                    for key in ['aadharnumber', 'dob', 'gender', 'age', 'age_status', 'aadhar_status']:
-                        logger.info(f"  {key}: {final_data.get(key)}")
-                    
-                    return {
-                        "success": True,
-                        "data": final_data,
-                        "debug_dir": str(session_dir) if session_dir else None,
-                        "card_rotation": card_rotation,
-                        "used_fallback": True
-                    }
+                    # Use full image for Qwen if needed
+                    image_for_qwen = original_img
                 else:
                     logger.error("❌ Fallback detection on full image also failed")
-                    return cropped_result
+                    final_data = cropped_result.get("data", {})
+                
+                # Check again after merge
+                missing_fields_after_merge = self._check_critical_fields(final_data, card_side)
+                has_missing = any(missing_fields_after_merge.values())
             else:
                 logger.info("✅ All critical fields present in cropped extraction")
-                return {
-                    "success": True,
-                    "data": cropped_result.get("data", {}),
-                    "debug_dir": str(session_dir) if session_dir else None,
-                    "card_rotation": card_rotation,
-                    "used_fallback": False
-                }
+                final_data = cropped_result.get("data", {})
+                missing_fields_after_merge = missing_fields
+            
+            # === ATTEMPT 3: QWEN VLM FALLBACK ===
+            used_qwen_fallback = False
+            
+            if self.enable_qwen_fallback and self.qwen_agent:
+                should_use_qwen, qwen_missing_fields = self.qwen_agent.should_use_fallback(final_data)
+                
+                if should_use_qwen:
+                    logger.info("\n" + "=" * 60)
+                    logger.info("🤖 ATTEMPT 3: QWEN VLM FALLBACK")
+                    logger.info("=" * 60)
+                    
+                    try:
+                        qwen_results = self.qwen_agent.extract_fields(
+                            image_for_qwen, 
+                            qwen_missing_fields, 
+                            card_side
+                        )
+                        
+                        if qwen_results:
+                            # Merge Qwen results
+                            final_data = self.qwen_agent.validate_and_merge(final_data, qwen_results)
+                            used_qwen_fallback = True
+                            logger.info("✅ Qwen fallback completed successfully")
+                        else:
+                            logger.warning("⚠️ Qwen fallback returned no results")
+                            
+                    except Exception as e:
+                        logger.error(f"❌ Qwen fallback failed: {e}")
+                        logger.error(traceback.format_exc())
+            
+            # Final validation summary
+            logger.info("\n" + "=" * 60)
+            logger.info("📋 FINAL EXTRACTION SUMMARY")
+            logger.info("=" * 60)
+            logger.info(f"Aadhaar Number: {final_data.get('aadharnumber', 'N/A')}")
+            logger.info(f"Aadhaar Status: {final_data.get('aadhar_status', 'N/A')}")
+            if final_data.get('aadhar_rejection_reason'):
+                logger.info(f"Rejection Reason: {final_data.get('aadhar_rejection_reason')}")
+            logger.info(f"DOB: {final_data.get('dob', 'N/A')}")
+            logger.info(f"Age: {final_data.get('age', 'N/A')}")
+            logger.info(f"Age Status: {final_data.get('age_status', 'N/A')}")
+            logger.info(f"Gender: {final_data.get('gender', 'N/A')}")
+            logger.info(f"Card Rotation: {card_rotation}°")
+            logger.info(f"Used Full Image Fallback: {has_missing}")
+            logger.info(f"Used Qwen Fallback: {used_qwen_fallback}")
+            logger.info("=" * 60)
+            
+            return {
+                "success": True,
+                "data": final_data,
+                "debug_dir": str(session_dir) if session_dir else None,
+                "card_rotation": card_rotation,
+                "used_fallback": has_missing,
+                "used_qwen_fallback": used_qwen_fallback
+            }
 
         except Exception as e:
             logger.error(f"Error in extraction: {e}\n{traceback.format_exc()}")
@@ -472,7 +492,6 @@ class EntityAgent:
     def detect_entities_in_image(self, image_input, confidence_threshold: float, card_side: str = 'front', session_dir: Path = None):
         """
         Modified to accept card_side parameter and filter entities accordingly.
-        Also saves annotated detection images.
         """
         logger.info(f"\nStep 1: Detecting entities in image (Side: {card_side}, Threshold: {confidence_threshold})")
         
@@ -495,7 +514,6 @@ class EntityAgent:
         elif card_side.lower() == 'back':
             target_entities = {'aadharnumber', 'address', 'address_other_lang', 'pincode', 'mobile_no', 'city'}
         else:
-            # Default to basic entities if side not specified
             target_entities = {'aadharnumber', 'dob', 'gender'}
         
         logger.info(f"  Target entities for {card_side}: {target_entities}")
@@ -503,9 +521,6 @@ class EntityAgent:
         # Run entity detection
         results = self.model2(img, device=self.device, verbose=False)
         card_detections = []
-        
-        # Create annotated image
-        annotated_img = img.copy()
         
         for box in results[0].boxes:
             if float(box.conf[0]) < confidence_threshold: 
@@ -522,31 +537,13 @@ class EntityAgent:
                 'class_name': class_name, 
                 'confidence': float(box.conf[0])
             })
-            
-            # Draw bounding box on annotated image
-            color = (0, 255, 0)  # Green
-            cv2.rectangle(annotated_img, (x1, y1), (x2, y2), color, 2)
-            
-            # Add label with confidence
-            label = f"{class_name}: {float(box.conf[0]):.2f}"
-            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            cv2.rectangle(annotated_img, (x1, y1 - label_size[1] - 5), 
-                         (x1 + label_size[0], y1), color, -1)
-            cv2.putText(annotated_img, label, (x1, y1 - 5), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
         
         logger.info(f"  Detected {len(card_detections)} entities")
-        
-        # Save annotated image
-        # if self.save_debug_images and session_dir:
-        #     annotated_path = session_dir / f"01_detections_{card_side}_annotated.jpg"
-        #     cv2.imwrite(str(annotated_path), annotated_img)
-        #     logger.info(f"Saved annotated detections: {annotated_path}")
         
         if not card_detections:
             return {}
 
-        # Wrap in your original structure
+        # Wrap in original structure
         all_detections = {
             input_name: {
                 "card_image": img,
@@ -558,19 +555,12 @@ class EntityAgent:
         return all_detections
 
     def crop_entities(self, all_detections: Dict[str, Dict[str, Any]], session_dir: Path = None):
-        """Step 3: Crop individual entities with bounds checking and save crops"""
+        """Step 3: Crop individual entities with bounds checking"""
         logger.info(f"\nStep 3: Cropping individual entities")
-        
-        # Create crops directory
-        crops_dir = None
-        # if self.save_debug_images and session_dir:
-        #     crops_dir = session_dir if isinstance(session_dir, Path) and session_dir.name.startswith("crops") else session_dir / "crops"
-        #     crops_dir.mkdir(exist_ok=True)
         
         for card_name, card_data in all_detections.items():
             img = card_data['card_image']
             h, w = img.shape[:2]
-            card_type = card_data.get('card_type', 'unknown')
             
             for i, detection in enumerate(card_data['detections']):
                 x1, y1, x2, y2 = detection['bbox']
@@ -588,15 +578,6 @@ class EntityAgent:
                 detection['cropped_image'] = crop
                 entity_key = f"{card_name}_{detection['class_name']}_{i}"
                 detection['entity_key'] = entity_key
-                
-                # Save individual crop
-                # if self.save_debug_images and crops_dir:
-                #     class_name = detection['class_name']
-                #     conf = detection['confidence']
-                #     crop_filename = f"{card_type}_{class_name}_{i}_conf{conf:.2f}.jpg"
-                #     crop_path = crops_dir / crop_filename
-                #     cv2.imwrite(str(crop_path), crop)
-                #     logger.info(f"  Saved crop: {crop_filename}")
         
         return all_detections
     
@@ -611,14 +592,13 @@ class EntityAgent:
             else:
                 gray = img.copy()
             
-            # Resize if too small (Aadhaar numbers need good resolution)
+            # Resize if too small
             h, w = gray.shape
             if h < 50:
                 scale = 50 / h
                 new_w, new_h = int(w * scale), int(h * scale)
                 gray = cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
             
-            # Try multiple preprocessing approaches and pick best
             preprocessed_versions = []
             
             # Version 1: Simple threshold
@@ -650,28 +630,24 @@ class EntityAgent:
     def _extract_aadhaar_with_multiple_methods(self, img: np.ndarray) -> str:
         """
         Try multiple OCR methods specifically for Aadhaar numbers.
-        Tries ALL 4 rotations for EACH preprocessing method.
         Returns the RAW OCR text (preserving X's for masked detection).
         """
         try:
             preprocessed_versions = self._preprocess_for_aadhaar_ocr(img)
             
-            # Try different PSM modes and configurations
             configs = [
-                '--psm 7',  # Single line, all chars (preserve X's)
-                '--psm 8',  # Single word, all chars
-                '--psm 6',  # Block of text, all chars
-                '--psm 7 -c tessedit_char_whitelist=0123456789X',  # Include X for masked Aadhaar
-                '--psm 13',  # Raw line
+                '--psm 7',
+                '--psm 8',
+                '--psm 6',
+                '--psm 7 -c tessedit_char_whitelist=0123456789X',
+                '--psm 13',
             ]
             
             best_result = ""
             best_score = 0
             
-            # Try all 4 rotations for each preprocessing method
             for method_name, processed_img in preprocessed_versions:
                 for rotation in [0, 90, 180, 270]:
-                    # Rotate the preprocessed image
                     if rotation == 0:
                         rotated_img = processed_img
                     elif rotation == 90:
@@ -687,29 +663,19 @@ class EntityAgent:
                             pil_img = Image.fromarray(rotated_img)
                             text = pytesseract.image_to_string(pil_img, lang='eng', config=config).strip()
                             
-                            # Keep original text (with X's if masked)
-                            # Score based on: length of valid chars (digits or X) + pattern matching
                             valid_chars = re.findall(r'[0-9X]', text, re.IGNORECASE)
                             score = len(valid_chars)
                             
-                            logger.debug(f"    Method: {method_name}, Rotation: {rotation}°, Config: {config[:20]}, Result: {text}, Score: {score}")
-                            
-                            # Keep track of best result
                             if score > best_score:
                                 best_score = score
                                 best_result = text
-                                logger.info(f"    Better result found: {text} (method: {method_name}, rotation: {rotation}°, score: {score})")
                             
-                            # If we got 12 chars (digits or X's), we likely have the full Aadhaar
                             if score >= 12:
-                                logger.info(f"    Complete Aadhaar found: {text} (method: {method_name}, rotation: {rotation}°)")
                                 return text
                                 
                         except Exception as e:
-                            logger.debug(f"    OCR attempt failed: {e}")
                             continue
             
-            logger.info(f"    Best Aadhaar result: {best_result} (score: {best_score})")
             return best_result
             
         except Exception as e:
@@ -726,10 +692,8 @@ class EntityAgent:
                 logger.warning(f"  Entity image data for {entity_key} is empty, skipping.")
                 return None
             
-            # Special handling for Aadhaar numbers - skip complex orientation detection
             if class_name == 'aadharnumber':
                 logger.info(f"  Using specialized Aadhaar preprocessing for {entity_key}")
-                # Return original image for specialized Aadhaar processing
                 return img
             
             h, w = img.shape[:2]
@@ -747,16 +711,13 @@ class EntityAgent:
                     osd = pytesseract.image_to_osd(img_for_analysis, output_type=pytesseract.Output.DICT)
                     if osd['orientation_conf'] > osd_confidence_threshold:
                         best_rotation = osd['rotate']
-                        logger.info(f" Using Tesseract OSD for {entity_key}: {best_rotation}° (conf: {osd['orientation_conf']:.2f})")
                     else:
                         best_rotation = 0
-                except pytesseract.TesseractError as e:
-                    logger.warning(f" OSD failed for {entity_key}. Assuming 0° rotation.")
+                except:
                     best_rotation = 0
             
             corrected_img = img
             if best_rotation != 0:
-                logger.info(f"   Correcting entity {entity_key} orientation by {best_rotation}°")
                 if best_rotation == 90: 
                     corrected_img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
                 elif best_rotation == 180: 
@@ -766,21 +727,17 @@ class EntityAgent:
 
             h_corr, w_corr = corrected_img.shape[:2]
             if h_corr > w_corr and 'address' not in entity_key:
-                logger.info(f"   Rotating vertical entity {entity_key} to horizontal format")
                 corrected_img = cv2.rotate(corrected_img, cv2.ROTATE_90_CLOCKWISE)
 
             from PIL import Image
             return Image.fromarray(cv2.cvtColor(corrected_img, cv2.COLOR_BGR2GRAY))
             
         except Exception as e:
-            logger.error(f"   Unhandled error during entity orientation/preprocessing for {entity_key}: {e}")
+            logger.error(f"   Error during entity orientation/preprocessing for {entity_key}: {e}")
             return None
 
     def _detect_orientation_by_letters(self, img: np.ndarray, entity_key: str) -> Optional[int]:
-        """
-        Detect the correct orientation by analyzing letter shapes and OCR confidence
-        at different rotation angles.
-        """
+        """Detect orientation by analyzing letter shapes and OCR confidence"""
         try:
             rotations = [0, 90, 180, 270]
             rotation_scores = {}
@@ -797,27 +754,19 @@ class EntityAgent:
                 
                 score = self._calculate_orientation_score(rotated_img, rotation)
                 rotation_scores[rotation] = score
-                logger.debug(f"      Rotation {rotation}°: score = {score:.3f}")
             
             best_rotation = max(rotation_scores.keys(), key=lambda k: rotation_scores[k])
             best_score = rotation_scores[best_rotation]
             
             if best_score > 0.1:
-                logger.info(f" Letter-based analysis for {entity_key}: {best_rotation}° (score: {best_score:.3f})")
                 return best_rotation
-            else:
-                logger.warning(f"   Letter-based analysis inconclusive for {entity_key} (best score: {best_score:.3f})")
-                return None
+            return None
                 
         except Exception as e:
-            logger.warning(f"  Error in letter-based orientation detection for {entity_key}: {e}")
             return None
 
     def _calculate_orientation_score(self, img: np.ndarray, rotation: int) -> float:
-        """
-        Calculate a comprehensive score for how likely this orientation is correct.
-        Combines OCR confidence, letter shapes, and text line analysis.
-        """
+        """Calculate orientation score"""
         try:
             if len(img.shape) == 3:
                 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -831,15 +780,11 @@ class EntityAgent:
             total_score = (ocr_score * 0.5 + shape_score * 0.3 + line_score * 0.2)
             return total_score
             
-        except Exception as e:
-            logger.debug(f"      Error calculating orientation score: {e}")
+        except:
             return 0.0
 
     def _get_ocr_confidence_score(self, gray_img: np.ndarray) -> float:
-        """
-        Get OCR confidence and text quality score by trying multiple PSM modes.
-        Returns a normalized score between 0 and 1.
-        """
+        """Get OCR confidence score"""
         try:
             psm_modes = [6, 7, 8, 13]
             best_confidence = 0.0
@@ -856,22 +801,18 @@ class EntityAgent:
                         if avg_confidence > best_confidence or (avg_confidence == best_confidence and text_length > best_text_length):
                             best_confidence = avg_confidence
                             best_text_length = text_length
-                            
-                except pytesseract.TesseractError:
+                except:
                     continue
             
             confidence_factor = best_confidence / 100.0
             length_factor = min(best_text_length / 10.0, 1.0)
             return confidence_factor * 0.7 + length_factor * 0.3
             
-        except Exception:
+        except:
             return 0.0
 
     def _analyze_letter_shapes(self, gray_img: np.ndarray) -> float:
-        """
-        Analyze the shapes of detected contours to determine if they look like upright letters.
-        Returns a normalized score between 0 and 1.
-        """
+        """Analyze letter shapes"""
         try:
             _, binary = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
             contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -902,15 +843,11 @@ class EntityAgent:
                 return 0.0
             return min(upright_score / valid_contours, 1.0)
             
-        except Exception:
+        except:
             return 0.0
 
     def _analyze_text_lines(self, gray_img: np.ndarray) -> float:
-        """
-        Analyze text line orientation using morphological operations.
-        Horizontal text should have more horizontal lines than vertical lines.
-        Returns a normalized score between 0 and 1.
-        """
+        """Analyze text line orientation"""
         try:
             _, binary = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
             
@@ -927,18 +864,16 @@ class EntityAgent:
             if total_pixels == 0:
                 return 0.5
             
-            horizontal_ratio = horizontal_pixels / total_pixels
-            return horizontal_ratio
+            return horizontal_pixels / total_pixels
             
-        except Exception:
+        except:
             return 0.5
 
     def perform_multi_language_ocr(self, all_detections: Dict[str, Dict[str, Any]]):
-        """
-        Step 4: Correcting orientation and perform OCR with specialized handling for Aadhaar.
-        """
-        logger.info(f"\nStep 4: Correcting Entity Orientation & Performing Multi-Language OCR")
+        """Step 4: Perform OCR with specialized handling for Aadhaar"""
+        logger.info(f"\nStep 4: Performing Multi-Language OCR")
         ocr_results = {}
+        
         for card_name, card_data in all_detections.items():
             for detection in card_data['detections']:
                 cropped_image = detection.get('cropped_image')
@@ -948,21 +883,16 @@ class EntityAgent:
                 if cropped_image is None or entity_key is None:
                     continue
 
-                logger.info(f"  Processing entity: {entity_key} (Class: {class_name})")
+                logger.info(f"  Processing: {entity_key}")
                 
-                # Special handling for Aadhaar numbers
                 if class_name == 'aadharnumber':
                     extracted_text = self._extract_aadhaar_with_multiple_methods(cropped_image)
                     ocr_results[entity_key] = extracted_text
                     if extracted_text:
-                        logger.info(f"    Aadhaar OCR Result: {extracted_text}")
-                    else:
-                        logger.warning(f"    Aadhaar OCR failed to extract number")
+                        logger.info(f"    Result: {extracted_text}")
                     continue
                 
-                # Regular processing for other entities
                 lang_to_use = self.other_lang_code if class_name and class_name.endswith('_other_lang') else 'eng'
-                
                 processed_pil_img = self._correct_entity_orientation_and_preprocess(cropped_image, entity_key, class_name)
 
                 if processed_pil_img:
@@ -970,15 +900,14 @@ class EntityAgent:
                         text = pytesseract.image_to_string(processed_pil_img, lang=lang_to_use, config='--psm 6')
                         extracted_text = ' '.join(text.split()).strip()
                         ocr_results[entity_key] = extracted_text
-                        logger.info(f"    OCR Result: {extracted_text[:50]}..." if len(extracted_text) > 50 else f"    OCR Result: {extracted_text}")
+                        logger.info(f"    Result: {extracted_text[:50]}...")
                     except Exception as e:
-                        logger.error(f" OCR failed for {entity_key}: {e}")
                         ocr_results[entity_key] = None
         return ocr_results
 
     def organize_results_by_card_type(self, all_detections: Dict[str, Dict[str, Any]], ocr_results: Dict[str, str], confidence_threshold: float):
-        """Your EXACT original result organization"""
-        logger.info("\nStep 5: Organizing final results")
+        """Step 5: Organize results"""
+        logger.info("\nStep 5: Organizing results")
         organized_results = {
             'front': {}, 'back': {},
             'metadata': {
@@ -986,6 +915,7 @@ class EntityAgent:
                 'confidence_threshold_used': confidence_threshold
             }
         }
+        
         for card_name, card_data in all_detections.items():
             card_type = card_data['card_type']
             
@@ -993,26 +923,25 @@ class EntityAgent:
                 organized_results[card_type][card_name] = {'entities': {}}
             
             for detection in card_data['detections']:
-                 entity_name = detection['class_name']
-                 entity_key = detection.get('entity_key')
-                 extracted_text = ocr_results.get(entity_key)
+                entity_name = detection['class_name']
+                entity_key = detection.get('entity_key')
+                extracted_text = ocr_results.get(entity_key)
 
-                 if entity_name not in organized_results[card_type][card_name]['entities']:
-                      organized_results[card_type][card_name]['entities'][entity_name] = []
+                if entity_name not in organized_results[card_type][card_name]['entities']:
+                    organized_results[card_type][card_name]['entities'][entity_name] = []
                  
-                 organized_results[card_type][card_name]['entities'][entity_name].append({
-                     'confidence': detection['confidence'], 
-                     'bbox': detection['bbox'],
-                     'extracted_text': extracted_text
-                 })
+                organized_results[card_type][card_name]['entities'][entity_name].append({
+                    'confidence': detection['confidence'], 
+                    'bbox': detection['bbox'],
+                    'extracted_text': extracted_text
+                })
         return organized_results
 
     def extract_main_fields(self, organized_results: Dict[str, Any]) -> Dict[str, Any]:
-        """Extract and validate main fields with strict masked Aadhaar rejection"""
+        """Extract and validate main fields with STRICT masked Aadhaar rejection"""
         fields = ['aadharnumber', 'dob', 'gender']
         data = {key: "" for key in fields}
         
-        # Special handling for Aadhar number to check both front and back
         aadhar_front = ""
         aadhar_back = ""
         
@@ -1030,211 +959,145 @@ class EntityAgent:
                                 elif side == 'back':
                                     aadhar_back = first_valid_text
                         elif field == 'dob':
-                            # For DOB, pick the one that contains a valid 4-digit year
-                            best_dob = data.get('dob', '')
                             for text in all_texts:
                                 if text:
-                                    # Check if this text contains a 4-digit year
                                     digit_groups = re.findall(r'\d+', text)
                                     has_valid_year = any(
                                         len(g) == 4 and 1900 <= int(g) <= datetime.now().year 
                                         for g in digit_groups
                                     )
                                     if has_valid_year:
-                                        logger.info(f"  Found DOB with valid year: '{text}'")
                                         data[field] = text
-                                        break  # Use the first one with a valid year
-                            # If no valid year found, use first non-empty text
+                                        break
                             if not data.get('dob'):
                                 first_valid_text = next((text for text in all_texts if text), '')
                                 if first_valid_text:
                                     data[field] = first_valid_text
                         else:
-                            # For other fields (like gender), use first valid text
                             first_valid_text = next((text for text in all_texts if text), '')
                             if first_valid_text:
                                 data[field] = first_valid_text
         
-        # --- CRITICAL: Check for Masked Aadhaar FIRST (Before any processing) ---
+        # === CRITICAL: Check for Masked Aadhaar FIRST ===
         logger.info("=" * 60)   
         logger.info("🔍 CHECKING FOR MASKED AADHAAR")
         logger.info("=" * 60)
         logger.info(f"Aadhar Front (RAW): '{aadhar_front}'")
         logger.info(f"Aadhar Back (RAW): '{aadhar_back}'")
         
-        is_masked = False
-        masked_source = None
+        is_masked_front = self._is_masked_aadhaar(aadhar_front)
+        is_masked_back = self._is_masked_aadhaar(aadhar_back)
         
-        # Check for ANY occurrence of 'X' (case-insensitive) in the RAW OCR text
-        if aadhar_front and 'X' in aadhar_front.upper():
-            is_masked = True
-            masked_source = 'front'
-            logger.warning(f"❌ MASKED AADHAAR DETECTED IN FRONT: '{aadhar_front}'")
-        
-        if aadhar_back and 'X' in aadhar_back.upper():
-            is_masked = True
-            masked_source = 'back' if not masked_source else 'both'
-            logger.warning(f"❌ MASKED AADHAAR DETECTED IN BACK: '{aadhar_back}'")
-        
-        # If masked Aadhaar detected, REJECT immediately
-        if is_masked:
-            logger.error(f"🚫 REJECTING USER: Masked Aadhaar detected in {masked_source}")
-            data['aadharnumber'] = aadhar_front if aadhar_front else aadhar_back  # Store the masked value
+        if is_masked_front or is_masked_back:
+            masked_source = 'front' if is_masked_front else 'back'
+            if is_masked_front and is_masked_back:
+                masked_source = 'both'
+            
+            logger.error(f"🚫 REJECTING: Masked Aadhaar detected in {masked_source}")
+            
+            # Store the masked value
+            data['aadharnumber'] = aadhar_front if aadhar_front else aadhar_back
             data['aadhar_status'] = "aadhar_disapproved"
             data['aadhar_rejection_reason'] = "masked_aadhar"
             
-            # Still process DOB and gender for completeness, but Aadhaar is rejected
-            # Continue with rest of the processing below
+            # Continue processing DOB and gender but Aadhaar is REJECTED
         else:
-            logger.info("✓ No masking detected, proceeding with Aadhaar validation")
+            logger.info("✅ No masking detected")
             
-            # --- Only process Aadhaar if NOT masked ---
+            # Process Aadhaar normally
             best_aadhar = ""
             aadhar_front_digits = re.sub(r'\D', '', aadhar_front) if aadhar_front else ""
             aadhar_back_digits = re.sub(r'\D', '', aadhar_back) if aadhar_back else ""
             
-            logger.info(f"Aadhar Front Digits: '{aadhar_front_digits}'")
-            logger.info(f"Aadhar Back Digits: '{aadhar_back_digits}'")
-            
             if aadhar_front_digits == aadhar_back_digits and aadhar_front_digits:
-                # Both match - use this
-                logger.info(f"✓ Aadhar match between front and back: {aadhar_front_digits}")
                 best_aadhar = aadhar_front_digits
             else:
-                # Different values - prefer the one with all 12 digits, or the one with more digits
                 if len(aadhar_front_digits) == 12:
-                    logger.info(f"✓ Using Aadhar from front (complete 12 digits): {aadhar_front_digits}")
                     best_aadhar = aadhar_front_digits
                 elif len(aadhar_back_digits) == 12:
-                    logger.info(f"✓ Using Aadhar from back (complete 12 digits): {aadhar_back_digits}")
                     best_aadhar = aadhar_back_digits
                 elif len(aadhar_front_digits) > len(aadhar_back_digits):
-                    logger.info(f"Using Aadhar from front (more digits): {aadhar_front_digits}")
                     best_aadhar = aadhar_front_digits
                 elif len(aadhar_back_digits) > len(aadhar_front_digits):
-                    logger.info(f"Using Aadhar from back (more digits): {aadhar_back_digits}")
                     best_aadhar = aadhar_back_digits
                 elif aadhar_front_digits:
-                    logger.info(f"Using Aadhar from front (fallback): {aadhar_front_digits}")
                     best_aadhar = aadhar_front_digits
                 elif aadhar_back_digits:
-                    logger.info(f"Using Aadhar from back (fallback): {aadhar_back_digits}")
                     best_aadhar = aadhar_back_digits
             
             data['aadharnumber'] = best_aadhar
             
-            # --- Aadhaar Number Validation (only if not masked) ---
+            # Validate Aadhaar
             aadhar_status = "aadhar_approved"
             aadhar_rejection_reason = None
             
             if data.get('aadharnumber'):
-                aad = data['aadharnumber']
-                # Extract only digits, remove all spaces and special characters
-                aad_digits_only = re.sub(r'\D', '', aad)
+                aad_digits_only = re.sub(r'\D', '', data['aadharnumber'])
                 
-                # Validate that we have exactly 12 digits
                 if len(aad_digits_only) == 12:
                     data['aadharnumber'] = aad_digits_only
-                    logger.info(f"✓ Valid Aadhaar number: {aad_digits_only}")
                 else:
-                    # If not exactly 12 digits, disapprove
                     aadhar_status = "aadhar_disapproved"
                     aadhar_rejection_reason = "invalid_length"
-                    data['aadharnumber'] = aad_digits_only  # Store what we got anyway
-                    logger.warning(f"❌ Invalid Aadhaar length: {len(aad_digits_only)} digits (expected 12)")
+                    data['aadharnumber'] = aad_digits_only
             else:
                 aadhar_status = "aadhar_disapproved"
                 aadhar_rejection_reason = "not_detected"
-                logger.warning("❌ Aadhaar number not detected")
             
             data['aadhar_status'] = aadhar_status
             if aadhar_rejection_reason:
                 data['aadhar_rejection_reason'] = aadhar_rejection_reason
         
-        # --- DOB Processing and Age Verification (Year-based only) ---
+        # DOB Processing
         age_status = "age_disapproved"
-        birth_year = None
         
         if data.get('dob'):
-            # Extract all digit groups from DOB text
             digit_groups = re.findall(r'\d+', data['dob'])
-            
-            # Look for a 4-digit year
             year = next((g for g in digit_groups if len(g) == 4 and 1900 <= int(g) <= datetime.now().year), None)
             
             if year:
-                try:
-                    birth_year = int(year)
-                    data['dob'] = str(birth_year)  # Store only the year
-                    
-                    # Calculate age based on year only
-                    current_year = datetime.now().year
-                    age = current_year - birth_year
-                    data['age'] = age
-                    
-                    # Approve if age >= 18
-                    if age >= 18:
-                        age_status = "age_approved"
-                        logger.info(f"✓ Age approved: {age} years old (born in {birth_year})")
-                    else:
-                        logger.info(f"❌ Age rejected: {age} years old (born in {birth_year})")
-                except ValueError:
-                    data['dob'] = 'Invalid Format'
-                    data['age'] = None
-                    logger.warning(f"Could not parse year from DOB: {data.get('dob')}")
+                birth_year = int(year)
+                data['dob'] = str(birth_year)
+                
+                current_year = datetime.now().year
+                age = current_year - birth_year
+                data['age'] = age
+                
+                if age >= 18:
+                    age_status = "age_approved"
             else:
                 data['dob'] = 'Invalid Format'
                 data['age'] = None
-                logger.warning(f"No valid 4-digit year found in DOB: {data.get('dob')}")
         else:
             data['dob'] = 'Not Detected'
             data['age'] = None
-            logger.info("DOB not detected")
         
         data['age_status'] = age_status
         
-        # --- Gender normalization (Enhanced) ---
+        # Gender normalization
         if data['gender']:
             gender = data['gender'].strip().lower()
-            # Remove special characters and extra spaces
             gender = re.sub(r'[^a-z]', '', gender)
             
-            # Check for male variations
             if 'male' in gender and 'female' not in gender:
                 data['gender'] = 'Male'
-            # Check for female variations
             elif 'female' in gender or 'femal' in gender:
                 data['gender'] = 'Female'
-            # Check for other common variations
             elif gender in ['m', 'man', 'boy']:
                 data['gender'] = 'Male'
-            elif gender in ['f', 'woman', 'girl', 'femlae', 'femaie']:
+            elif gender in ['f', 'woman', 'girl']:
                 data['gender'] = 'Female'
             else:
                 data['gender'] = 'Other'
         else:
             data['gender'] = 'Not Detected'
         
-        # Final summary log
-        logger.info("\n" + "=" * 60)
-        logger.info("📋 FINAL VALIDATION SUMMARY")
-        logger.info("=" * 60)
-        logger.info(f"Aadhaar Number: {data.get('aadharnumber', 'N/A')}")
-        logger.info(f"Aadhaar Status: {data.get('aadhar_status', 'N/A')}")
-        if data.get('aadhar_rejection_reason'):
-            logger.info(f"Rejection Reason: {data.get('aadhar_rejection_reason')}")
-        logger.info(f"DOB: {data.get('dob', 'N/A')}")
-        logger.info(f"Age: {data.get('age', 'N/A')}")
-        logger.info(f"Age Status: {data.get('age_status', 'N/A')}")
-        logger.info(f"Gender: {data.get('gender', 'N/A')}")
-        logger.info("=" * 60)
-            
         return data
 
-# Usage Check
+
 if __name__ == "__main__":
     try:
-        agent = EntityAgent(model_path="models/best.pt")
-        print("✓ Entity Agent initialized successfully")
+        agent = EntityAgent(model_path="models/best.pt", enable_qwen_fallback=True)
+        print("✅ Entity Agent initialized successfully")
     except Exception as e:
-        print(f"✗ Initialization failed: {e}")
+        print(f"❌ Initialization failed: {e}")
