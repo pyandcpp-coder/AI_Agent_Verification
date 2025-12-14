@@ -3,9 +3,17 @@ import aiohttp
 import time
 import json
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 import gspread
+from dotenv import load_dotenv
+
+# Import Redis cache
+from redis_cache import get_cache
+
+# Load environment variables
+load_dotenv()
 
 BASE_URL = "https://qoneqt.com/v1/api"
 ADMIN_ID = 27  
@@ -643,6 +651,15 @@ async def process_single_user(session, user, session_dir, agent_id):
                     if push_payload['rejection_reasons']:
                         decision_log += f" | Reasons: {', '.join(push_payload['rejection_reasons'])}"
                     logger.info(f"✅ User {user_id}: Processed & Pushed ({decision_log})")
+                    
+                    # Store in Redis cache after successful push
+                    redis_cache = get_cache()
+                    if redis_cache.enabled:
+                        redis_cache.store_verification_result(
+                            user_id=str(user_id),
+                            verification_result=ai_result,
+                            api_response=push_result
+                        )
                 else:
                     error_text = await push_resp.text()
                     push_call_log["error"] = error_text
@@ -745,6 +762,9 @@ async def process_agent_batch(session, agent_id, session_dir):
     """Process a single batch for a specific agent"""
     logger.info(f"🔄 --- Starting Cycle for Agent {agent_id} ---")
     
+    # Get Redis cache instance
+    redis_cache = get_cache()
+    
     # 1. Lock Batch
     locked_ids = await lock_batch(session, agent_id)
     
@@ -760,7 +780,32 @@ async def process_agent_batch(session, agent_id, session_dir):
         await release_batch(session, agent_id)
         return False
     
-    # 3. Process Batch
+    # 3. Check Redis Cache - Filter out already processed users
+    if redis_cache.enabled:
+        logger.info(f"🔍 Checking Redis cache for {len(users_to_process)} users...")
+        user_ids_to_check = [str(u.get("user_id", u.get("id"))) for u in users_to_process]
+        cache_status = redis_cache.bulk_check_users(user_ids_to_check)
+        
+        # Filter out cached users
+        users_before = len(users_to_process)
+        users_to_process = [
+            u for u in users_to_process 
+            if not cache_status.get(str(u.get("user_id", u.get("id"))), False)
+        ]
+        users_after = len(users_to_process)
+        
+        cached_count = users_before - users_after
+        if cached_count > 0:
+            logger.info(f"⚡ Skipped {cached_count} already verified users from cache")
+            logger.info(f"📋 Processing {users_after} new users")
+        
+        # If all users were cached, release batch and return
+        if not users_to_process:
+            logger.info(f"✨ All {users_before} users already verified - nothing to process!")
+            await release_batch(session, agent_id)
+            return True
+    
+    # 4. Process Batch
     batch_start_time = time.time()
     batch_results = []
     
@@ -830,6 +875,15 @@ async def run_pipeline():
     async with aiohttp.ClientSession() as session:
         try:
             agent_sessions = {}
+            
+            # Initialize Redis Cache
+            redis_cache = get_cache()
+            if redis_cache.enabled:
+                logger.info("✅ Redis cache enabled")
+                cache_stats = redis_cache.get_cache_stats()
+                logger.info(f"📊 Redis Cache Stats: {cache_stats['total_entries']} entries, TTL: {cache_stats['default_ttl_hours']}h")
+            else:
+                logger.info("ℹ️  Redis cache disabled (set REDIS_ENABLED=true to enable)")
             
             # Initialize Google Sheets Logger (optional)
             # Set GOOGLE_SHEETS_ENABLED=true and provide credentials to enable

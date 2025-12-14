@@ -21,3 +21,4 @@ brotlipy
 requests
 cloudscraper
 gspread
+redis
