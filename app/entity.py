@@ -84,46 +84,150 @@ class EntityAgent:
              logger.critical(f"An error occurred while checking Tesseract: {e}")
              raise RuntimeError(f"Error checking Tesseract: {e}")
 
+    def _is_garbage_text(self, text: str) -> bool:
+        """
+        Detect if text is garbage/nonsense (random characters, OCR errors, etc.).
+        
+        Returns True if text appears to be garbage.
+        """
+        if not text:
+            return True
+        
+        text_str = str(text).strip()
+        
+        # Check 1: Too long (Aadhaar should be ~12 chars, even with spaces maybe 20)
+        if len(text_str) > 50:
+            logger.warning(f"  Garbage check: Too long ({len(text_str)} chars)")
+            return True
+        
+        # Check 2: Contains newlines (Aadhaar should be single line)
+        if '\n' in text_str or '\r' in text_str:
+            logger.warning(f"  Garbage check: Contains newlines")
+            return True
+        
+        # Check 3: Too many non-alphanumeric characters
+        # Aadhaar can have spaces, dashes, but not much else
+        non_alphanum = sum(1 for c in text_str if not c.isalnum() and c not in [' ', '-'])
+        if non_alphanum > 5:
+            logger.warning(f"  Garbage check: Too many special chars ({non_alphanum})")
+            return True
+        
+        # Check 4: Contains obvious garbage patterns
+        garbage_patterns = [
+            r'[a-zA-Z]{10,}',  # Long sequences of letters (10+ in a row)
+            r'\.{3,}',  # Multiple dots
+            r'\s{5,}',  # Long whitespace sequences
+            r'[^\w\s-]{3,}',  # 3+ special chars in a row
+        ]
+        
+        for pattern in garbage_patterns:
+            if re.search(pattern, text_str):
+                logger.warning(f"  Garbage check: Matched pattern {pattern}")
+                return True
+        
+        # Check 5: Very low digit ratio (Aadhaar should be mostly digits)
+        digits = sum(1 for c in text_str if c.isdigit())
+        total_chars = len(text_str.replace(' ', '').replace('-', ''))
+        
+        if total_chars > 0:
+            digit_ratio = digits / total_chars
+            if digit_ratio < 0.5:  # Less than 50% digits
+                logger.warning(f"  Garbage check: Low digit ratio ({digit_ratio:.2%})")
+                return True
+        
+        return False
+
     def _is_masked_aadhaar(self, text: str) -> bool:
         """
-        Enhanced masked Aadhaar detection with multiple checks.
+        ULTRA STRICT masked Aadhaar detection with multiple checks.
         
-        Returns True if the Aadhaar is masked (contains X's).
+        Returns True if the Aadhaar is masked (contains X's or similar characters).
         """
         if not text:
             return False
         
         text_upper = str(text).upper()
+        text_clean = text.replace(' ', '').replace('-', '').upper()
         
-        # Check 1: Direct presence of 'X' character
+        # Check 1: Direct presence of 'X' character (case insensitive)
         if 'X' in text_upper:
-            logger.warning(f"🚫 MASKED AADHAAR DETECTED (contains X): '{text}'")
+            logger.error(f"🚫 MASKED AADHAAR DETECTED (contains X): '{text}'")
             return True
         
         # Check 2: Pattern matching for common masked formats
-        # XXXX XXXX 1234, XXXXXXXX1234, etc.
         masked_patterns = [
-            r'X{4,}',  # 4 or more X's in a row
-            r'[X\s-]{8,}[0-9]{4}',  # 8+ chars of X/space/dash followed by 4 digits
-            r'[0-9X\s-]*X{2,}[0-9X\s-]*',  # Any sequence containing 2+ X's
+            r'X{2,}',  # 2 or more X's in a row
+            r'[X\s-]{4,}[0-9]{4}',  # 4+ chars of X/space/dash followed by 4 digits
+            r'[0-9X\s-]*X+[0-9X\s-]*',  # Any sequence containing X
+            r'\*{2,}',  # 2 or more asterisks
+            r'[*\s-]{4,}[0-9]{4}',  # Asterisk patterns
         ]
         
         for pattern in masked_patterns:
             if re.search(pattern, text_upper):
-                logger.warning(f"🚫 MASKED AADHAAR DETECTED (pattern match): '{text}'")
+                logger.error(f"🚫 MASKED AADHAAR DETECTED (pattern: {pattern}): '{text}'")
                 return True
         
-        # Check 3: Look for common masked Aadhaar indicators
-        # Sometimes OCR might read 'X' as similar characters
-        suspicious_chars = ['×', 'x', 'X', '*', '×']
-        text_clean = text.replace(' ', '').replace('-', '')
-        
+        # Check 3: Look for suspicious characters that might be X or similar
+        suspicious_chars = ['×', 'x', 'X', '*', '×', '✕', '✖', 'χ']
         suspicious_count = sum(text_clean.count(char) for char in suspicious_chars)
-        if suspicious_count >= 4:  # If 4+ suspicious characters
-            logger.warning(f"🚫 MASKED AADHAAR DETECTED (suspicious chars): '{text}'")
+        
+        if suspicious_count >= 2:  # Even 2 suspicious characters mean masked
+            logger.error(f"🚫 MASKED AADHAAR DETECTED ({suspicious_count} suspicious chars): '{text}'")
             return True
         
+        # Check 4: Check if cleaned text has non-digit characters in positions 0-7
+        # Normal Aadhaar: all digits. Masked: XXXX XXXX 1234
+        if len(text_clean) >= 8:
+            first_eight = text_clean[:8]
+            non_digit_count = sum(1 for c in first_eight if not c.isdigit())
+            if non_digit_count >= 2:  # If first 8 chars have 2+ non-digits, likely masked
+                logger.error(f"🚫 MASKED AADHAAR DETECTED (non-digits in first 8 chars): '{text}'")
+                return True
+        
         return False
+
+    def _validate_aadhaar_number(self, text: str) -> Tuple[bool, str, Optional[str]]:
+        """
+        STRICT Aadhaar validation.
+        
+        Returns:
+            (is_valid, cleaned_number, rejection_reason)
+        """
+        if not text:
+            return False, "", "not_detected"
+        
+        text_str = str(text).strip()
+        
+        # CRITICAL: Check for garbage FIRST
+        if self._is_garbage_text(text_str):
+            logger.error(f"🗑️ VALIDATION FAILED: Garbage text detected: '{text_str[:100]}...'")
+            # Try to salvage any digits
+            digits_only = re.sub(r'\D', '', text_str)
+            if len(digits_only) >= 8:
+                return False, digits_only, "invalid_length"
+            return False, "", "not_detected"
+        
+        # First check for masking - THIS IS PRIORITY #1
+        if self._is_masked_aadhaar(text_str):
+            logger.error(f"🚫 VALIDATION FAILED: Masked Aadhaar: '{text_str}'")
+            return False, text_str, "masked_aadhar"
+        
+        # Extract only digits
+        digits_only = re.sub(r'\D', '', text_str)
+        
+        # Check length - MUST BE EXACTLY 12 DIGITS
+        if len(digits_only) != 12:
+            logger.error(f"🚫 VALIDATION FAILED: Invalid length ({len(digits_only)} digits): '{text_str}' -> '{digits_only}'")
+            return False, digits_only, "invalid_length"
+        
+        # Check for all zeros or all same digit
+        if digits_only == '0' * 12 or len(set(digits_only)) == 1:
+            logger.error(f"🚫 VALIDATION FAILED: Invalid pattern (all same): '{digits_only}'")
+            return False, digits_only, "invalid_pattern"
+        
+        logger.info(f"✅ VALIDATION PASSED: '{digits_only}'")
+        return True, digits_only, None
 
     def _detect_card_rotation(self, img: np.ndarray, session_dir: Path = None) -> int:
         """
@@ -166,12 +270,11 @@ class EntityAgent:
             
             for box in results[0].boxes:
                 conf = float(box.conf[0])
-                if conf >= 0.15:  # Use same threshold
+                if conf >= 0.15:
                     class_name = self.entity_classes.get(int(box.cls[0]), "unknown")
                     detected_entities.append((class_name, conf))
                     total_conf += conf
                     
-                    # Track critical entities
                     if class_name in critical_entities:
                         critical_entities[class_name] += 1
             
@@ -180,14 +283,10 @@ class EntityAgent:
             avg_conf = total_conf / num_entities if num_entities > 0 else 0
             critical_count = sum(1 for v in critical_entities.values() if v > 0)
             
-            # Scoring formula:
-            # - 40% weight on number of entities detected
-            # - 30% weight on average confidence
-            # - 30% weight on critical entities present
             score = (
-                (num_entities / 10) * 0.4 +  # Normalize by expected max ~10 entities
+                (num_entities / 10) * 0.4 +
                 avg_conf * 0.3 +
-                (critical_count / 3) * 0.3  # 3 critical entities
+                (critical_count / 3) * 0.3
             )
             
             rotation_scores[angle] = score
@@ -201,7 +300,6 @@ class EntityAgent:
             logger.info(f"  Rotation {angle}°: score={score:.3f}, entities={num_entities}, "
                        f"avg_conf={avg_conf:.3f}, critical={critical_count}/3")
         
-        # Select best rotation
         best_rotation = max(rotation_scores.keys(), key=lambda k: rotation_scores[k])
         best_score = rotation_scores[best_rotation]
         
@@ -224,61 +322,63 @@ class EntityAgent:
             value = final_data.get(field, "")
             
             if field == 'aadharnumber':
-                # Check if valid 12-digit number AND not masked
-                digits = re.sub(r'\D', '', str(value))
-                is_masked = self._is_masked_aadhaar(str(value))
-                missing[field] = (len(digits) != 12) or is_masked
+                # Use strict validation
+                is_valid, _, _ = self._validate_aadhaar_number(value)
+                missing[field] = not is_valid
             elif field == 'dob':
-                # Check if not "Invalid Format" or "Not Detected"
                 missing[field] = value in ['Invalid Format', 'Not Detected', '', None]
             elif field == 'gender':
-                # Check if not "Not Detected" or "Other"
                 missing[field] = value in ['Not Detected', 'Other', '', None]
             else:
                 missing[field] = not value
         
         return missing
 
-    def _merge_results(self, cropped_data: Dict[str, Any], full_data: Dict[str, Any], 
-                       missing_fields: Dict[str, bool]) -> Dict[str, Any]:
+    def _merge_results_without_mask_blocking(self, cropped_data: Dict[str, Any], 
+                                             full_data: Dict[str, Any], 
+                                             missing_fields: Dict[str, bool]) -> Dict[str, Any]:
         """
-        Merge results from cropped and full image detections.
-        Prefer full image results for missing/invalid fields.
+        Merge results WITHOUT blocking masked Aadhaar early.
+        Let Qwen verify later.
         """
         merged = cropped_data.copy()
         
-        logger.info("🔀 Merging results from cropped and full image detections...")
+        logger.info("🔀 Merging results (without early mask rejection)...")
         
         for field, is_missing in missing_fields.items():
             if is_missing:
                 full_value = full_data.get(field)
                 cropped_value = cropped_data.get(field)
                 
-                # For aadharnumber, check if full version is better
                 if field == 'aadharnumber':
-                    full_digits = re.sub(r'\D', '', str(full_value)) if full_value else ""
-                    cropped_digits = re.sub(r'\D', '', str(cropped_value)) if cropped_value else ""
+                    # Validate both values but DON'T reject masked yet
+                    full_valid, full_clean, full_reason = self._validate_aadhaar_number(full_value)
+                    cropped_valid, cropped_clean, cropped_reason = self._validate_aadhaar_number(cropped_value)
                     
-                    # Check for masking
-                    full_masked = self._is_masked_aadhaar(str(full_value))
-                    cropped_masked = self._is_masked_aadhaar(str(cropped_value))
-                    
-                    if not full_masked and len(full_digits) == 12 and (len(cropped_digits) != 12 or cropped_masked):
-                        logger.info(f"  ✓ Using full image {field}: {full_digits}")
-                        merged[field] = full_digits
+                    # If full is valid (not masked, 12 digits), use it
+                    if full_valid:
+                        logger.info(f"  ✓ Using VALID full image {field}: {full_clean}")
+                        merged[field] = full_clean
                         merged['aadhar_status'] = 'aadhar_approved'
                         if 'aadhar_rejection_reason' in merged:
                             del merged['aadhar_rejection_reason']
-                    elif len(full_digits) > len(cropped_digits) and not full_masked:
-                        logger.info(f"  ✓ Using full image {field} (more digits): {full_digits}")
-                        merged[field] = full_digits
+                    # Otherwise, use the one with more digits (even if masked)
+                    elif len(full_clean) > len(cropped_clean):
+                        logger.warning(f"  ⚠️ Using full image {field} (more digits): {full_clean}")
+                        merged[field] = full_clean
+                        # Keep rejection info but let Qwen verify later
+                        # 🚫 HARD STOP for masked Aadhaar
+                        if full_reason == 'masked_aadhar' or cropped_reason == 'masked_aadhar':
+                            merged['aadharnumber'] = full_value or cropped_value
+                            merged['aadhar_status'] = 'aadhar_disapproved'
+                            merged['aadhar_rejection_reason'] = 'masked_aadhar'
+                            return merged  # ⛔ STOP HERE
+
                 
-                # For other fields, use full if cropped is invalid
                 elif full_value and full_value not in ['Invalid Format', 'Not Detected', 'Other', '']:
                     logger.info(f"  ✓ Using full image {field}: {full_value}")
                     merged[field] = full_value
                     
-                    # Update related status fields
                     if field == 'dob':
                         merged['age'] = full_data.get('age')
                         merged['age_status'] = full_data.get('age_status')
@@ -288,13 +388,14 @@ class EntityAgent:
     def extract_from_file(self, file_path: str, crop_coords: List[int] = None, 
                          confidence_threshold: float = 0.15, card_side: str = 'front'):
         """
-        Main Entry Point with CARD ROTATION DETECTION + FALLBACK mechanism + QWEN FALLBACK.
+        Main Entry Point with CARD ROTATION + 2 FALLBACKS + QWEN (with delayed masked rejection).
         
-        Flow:
+        MODIFIED LOGIC:
         1. Detect card rotation
         2. Try extraction with crop coordinates
-        3. If critical fields missing, try full image (2nd fallback)
-        4. If still missing/invalid, try Qwen VLM (3rd fallback)
+        3. If critical fields missing/invalid, try full image (2nd fallback)
+        4. If Aadhaar still invalid OR masked, try Qwen (3rd fallback) - GIVE QWEN A CHANCE
+        5. ONLY reject masked Aadhaar if Qwen ALSO detects it as masked
         """
         try:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -309,7 +410,7 @@ class EntityAgent:
             # 2. DETECT CARD-LEVEL ROTATION
             card_rotation = self._detect_card_rotation(original_img, session_dir)
             
-            # 3. Apply card rotation to original image
+            # 3. Apply card rotation
             if card_rotation != 0:
                 logger.info(f"🔄 Applying card rotation: {card_rotation}°")
                 if card_rotation == 90:
@@ -319,19 +420,18 @@ class EntityAgent:
                 elif card_rotation == 270:
                     original_img = cv2.rotate(original_img, cv2.ROTATE_90_CLOCKWISE)
 
-            # === ATTEMPT 1: Try with Crop Coordinates ===
+            # === ATTEMPT 1: Extraction with CROP ===
             logger.info("=" * 60)
             logger.info("🔍 ATTEMPT 1: Extraction with CROP coordinates")
             logger.info("=" * 60)
             
             img = original_img.copy()
             
-            # Apply crop if coords provided
             if crop_coords:
                 x1, y1, x2, y2 = crop_coords
                 h, w = img.shape[:2]
                 
-                # IMPORTANT: Adjust crop coordinates if card was rotated
+                # Adjust crop for rotation
                 if card_rotation == 90:
                     x1, y1, x2, y2 = y1, w - x2, y2, w - x1
                 elif card_rotation == 180:
@@ -342,19 +442,18 @@ class EntityAgent:
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(w, x2), min(h, y2)
                 
-                logger.info(f"Cropping image to: [{x1}, {y1}, {x2}, {y2}] (after rotation adjustment)")
+                logger.info(f"Cropping to: [{x1}, {y1}, {x2}, {y2}]")
                 img = img[y1:y2, x1:x2]
             else:
-                logger.info("No crop coordinates provided, using full image")
+                logger.info("No crop coordinates, using full image")
 
-            # Run detection and OCR on cropped image
+            # Run detection on cropped
             all_detections = self.detect_entities_in_image(img, confidence_threshold, card_side, session_dir)
             
             if not all_detections:
-                logger.warning("⚠️ No entities detected in cropped region")
+                logger.warning("⚠️ No entities in crop")
                 cropped_result = {
                     "success": False,
-                    "message": "no_entities_detected",
                     "data": {"aadharnumber": "", "dob": "Not Detected", "gender": "Not Detected"}
                 }
             else:
@@ -362,32 +461,28 @@ class EntityAgent:
                 ocr_results = self.perform_multi_language_ocr(all_detections)
                 organized = self.organize_results_by_card_type(all_detections, ocr_results, confidence_threshold)
                 cropped_data = self.extract_main_fields(organized)
-                
-                cropped_result = {
-                    "success": True,
-                    "data": cropped_data
-                }
+                cropped_result = {"success": True, "data": cropped_data}
             
-            # === CHECK: Are critical fields missing? ===
+            # === CHECK CRITICAL FIELDS ===
             logger.info("\n" + "=" * 60)
-            logger.info("🔍 Checking for missing critical fields...")
+            logger.info("🔍 Checking critical fields from CROP...")
             logger.info("=" * 60)
             
             missing_fields = self._check_critical_fields(cropped_result.get("data", {}), card_side)
             has_missing = any(missing_fields.values())
             
-            # Track which image to use for Qwen fallback
-            image_for_qwen = img  # Start with cropped image
+            image_for_qwen = img
+            final_data = cropped_result.get("data", {})
             
+            # === ATTEMPT 2: FALLBACK to Full Image ===
             if has_missing:
-                logger.warning("⚠️ CRITICAL FIELDS MISSING from cropped extraction:")
+                logger.warning("⚠️ CRITICAL FIELDS MISSING/INVALID from crop:")
                 for field, is_missing in missing_fields.items():
                     if is_missing:
-                        logger.warning(f"  ❌ {field}: Missing or Invalid")
+                        logger.warning(f"  ❌ {field}")
                 
-                # === ATTEMPT 2: FALLBACK to Full Image ===
                 logger.info("\n" + "=" * 60)
-                logger.info("🔄 ATTEMPT 2: FALLBACK - Running on FULL ORIGINAL image")
+                logger.info("🔄 ATTEMPT 2: FALLBACK - Full Image")
                 logger.info("=" * 60)
                 
                 full_detections = self.detect_entities_in_image(
@@ -395,71 +490,242 @@ class EntityAgent:
                 )
                 
                 if full_detections:
-                    full_crops_dir = None
-                    
-                    self.crop_entities(full_detections, full_crops_dir)
+                    self.crop_entities(full_detections, None)
                     full_ocr_results = self.perform_multi_language_ocr(full_detections)
                     full_organized = self.organize_results_by_card_type(
                         full_detections, full_ocr_results, confidence_threshold
                     )
                     full_data = self.extract_main_fields(full_organized)
                     
-                    # Merge results
                     logger.info("\n" + "=" * 60)
-                    logger.info("🔀 MERGING results from both attempts...")
+                    logger.info("🔀 MERGING crop + full image results...")
                     logger.info("=" * 60)
                     
-                    final_data = self._merge_results(
-                        cropped_result.get("data", {}), 
-                        full_data, 
-                        missing_fields
+                    # MODIFIED: Don't block merge for masked Aadhaar - let Qwen verify later
+                    final_data = self._merge_results_without_mask_blocking(
+                        cropped_result.get("data", {}), full_data, missing_fields
                     )
-                    
-                    # Use full image for Qwen if needed
                     image_for_qwen = original_img
                 else:
-                    logger.error("❌ Fallback detection on full image also failed")
-                    final_data = cropped_result.get("data", {})
-                
-                # Check again after merge
-                missing_fields_after_merge = self._check_critical_fields(final_data, card_side)
-                has_missing = any(missing_fields_after_merge.values())
+                    logger.error("❌ Fallback detection failed")
             else:
-                logger.info("✅ All critical fields present in cropped extraction")
-                final_data = cropped_result.get("data", {})
-                missing_fields_after_merge = missing_fields
+                logger.info("✅ All critical fields present in crop")
             
-            # === ATTEMPT 3: QWEN VLM FALLBACK ===
+            # === RECHECK AFTER MERGE ===
+            missing_after_merge = self._check_critical_fields(final_data, card_side)
+            aadhaar_invalid = missing_after_merge.get('aadharnumber', False)
+            
+            # =====================================================================
+            # === ATTEMPT 3: QWEN FALLBACK (MODIFIED LOGIC - NO EARLY REJECTION)
+            # =====================================================================
             used_qwen_fallback = False
+            qwen_detected_masked = False  # Track if Qwen also detects masked
             
             if self.enable_qwen_fallback and self.qwen_agent:
-                should_use_qwen, qwen_missing_fields = self.qwen_agent.should_use_fallback(final_data)
+                aadhaar_value = final_data.get('aadharnumber', '')
+                aadhaar_rejection = final_data.get('aadhar_rejection_reason')
+                
+                # NEW LOGIC: Allow Qwen to try even if masked or invalid detected
+                # Only block if there's already a valid 12-digit Aadhaar
+                has_valid_aadhaar = (
+                    aadhaar_value and 
+                    len(re.sub(r'\D', '', aadhaar_value)) == 12 and
+                    aadhaar_rejection != 'masked_aadhar' and
+                    aadhaar_rejection != 'invalid_length'
+                )
+                
+                # Trigger Qwen if:
+                # 1. Aadhaar is invalid (not 12 digits) - EVEN IF MASKED
+                # 2. Aadhaar is masked (give Qwen a chance to find the real one)
+                # 3. Aadhaar not detected at all
+                # 4. Other critical fields are missing
+                should_use_qwen = (
+                    not has_valid_aadhaar and
+                    aadhaar_rejection != 'masked_aadhar' and
+                    (aadhaar_invalid or any(missing_after_merge.values()))
+                )
+
                 
                 if should_use_qwen:
                     logger.info("\n" + "=" * 60)
                     logger.info("🤖 ATTEMPT 3: QWEN VLM FALLBACK")
                     logger.info("=" * 60)
                     
+                    # Determine which fields need Qwen
+                    qwen_fields = []
+                    
+                    # MODIFIED: Always include aadharnumber if it's invalid OR masked
+                    if aadhaar_invalid or aadhaar_rejection in ['masked_aadhar', 'invalid_length', 'not_detected']:
+                        qwen_fields.append('aadharnumber')
+                        if aadhaar_rejection == 'masked_aadhar':
+                            logger.warning("⚠️ Masked Aadhaar detected - giving Qwen a chance to find real number")
+                    
+                    # Add other missing fields
+                    for field, is_missing in missing_after_merge.items():
+                        if is_missing and field != 'aadharnumber':
+                            qwen_fields.append(field)
+                    
+                    logger.info(f"Requesting Qwen for fields: {qwen_fields}")
+                    
                     try:
                         qwen_results = self.qwen_agent.extract_fields(
                             image_for_qwen, 
-                            qwen_missing_fields, 
+                            qwen_fields, 
                             card_side
                         )
                         
                         if qwen_results:
+                            # Validate Qwen Aadhaar result with STRICT checks
+                            if 'aadharnumber' in qwen_results:
+                                qwen_aadhar = qwen_results['aadharnumber']
+                                logger.info(f"🔍 Qwen returned Aadhaar: '{qwen_aadhar[:100]}...'")
+                                
+                                # Step 1: Check for garbage
+                                is_garbage = self._is_garbage_text(qwen_aadhar)
+                                
+                                if is_garbage:
+                                    logger.error(f"🗑️ QWEN returned GARBAGE: IGNORING")
+                                    qwen_results.pop('aadharnumber')
+                                else:
+                                    # Step 2: Check if Qwen ALSO detected masked Aadhaar
+                                    qwen_is_masked = self._is_masked_aadhaar(qwen_aadhar)
+                                    
+                                    if qwen_is_masked:
+                                        logger.error(f"🚫 QWEN DETECTED MASKED AADHAAR: '{qwen_aadhar}'")
+                                        logger.error(f"🚫 IMMEDIATE REJECTION - Qwen confirmed masking")
+                                        qwen_detected_masked = True
+                                        # IMMEDIATE REJECTION - Set final data right now
+                                        final_data['aadharnumber'] = qwen_aadhar
+                                        final_data['aadhar_status'] = 'aadhar_disapproved'
+                                        final_data['aadhar_rejection_reason'] = 'masked_aadhar'
+                                        # Mark for immediate rejection
+                                        qwen_results['aadharnumber'] = qwen_aadhar
+                                        qwen_results['is_masked'] = True
+                                        qwen_results['immediate_reject'] = True
+                                    else:
+                                        # Step 3: Validate normally
+                                        is_valid, clean_aadhar, rejection = self._validate_aadhaar_number(qwen_aadhar)
+                                        
+                                        if is_valid:
+                                            logger.info(f"✅ QWEN found VALID Aadhaar: {clean_aadhar}")
+                                            qwen_results['aadharnumber'] = clean_aadhar
+                                            qwen_results['is_valid'] = True
+                                        else:
+                                            logger.warning(f"⚠️ QWEN Aadhaar invalid: {clean_aadhar} (reason: {rejection})")
+                                            # Keep whatever we got, might be better than nothing
+                                            qwen_results['aadharnumber'] = clean_aadhar if clean_aadhar else qwen_aadhar
+                            
                             # Merge Qwen results
-                            final_data = self.qwen_agent.validate_and_merge(final_data, qwen_results)
+                            for field, value in qwen_results.items():
+                                if field == 'aadharnumber':
+                                    if qwen_results.get('immediate_reject'):
+                                        # IMMEDIATE REJECTION - Don't process further
+                                        logger.error(f"  🚫 QWEN DETECTED MASKED - IMMEDIATE REJECTION")
+                                        logger.error(f"  🚫 Stopping further processing")
+                                        break  # Stop processing other fields
+                                    elif qwen_results.get('is_valid'):
+                                        # Qwen found a valid Aadhaar - override everything
+                                        final_data['aadharnumber'] = value
+                                        final_data['aadhar_status'] = 'aadhar_approved'
+                                        if 'aadhar_rejection_reason' in final_data:
+                                            del final_data['aadhar_rejection_reason']
+                                        logger.info(f"  ✅ OVERRIDING with Qwen's VALID Aadhaar: {value}")
+                                    elif qwen_results.get('is_masked'):
+                                        # This shouldn't happen (immediate_reject should catch it)
+                                        # But keep as safety net
+                                        final_data['aadharnumber'] = value
+                                        final_data['aadhar_status'] = 'aadhar_disapproved'
+                                        final_data['aadhar_rejection_reason'] = 'masked_aadhar'
+                                        logger.error(f"  🚫 Qwen CONFIRMED masked - REJECTING")
+                                    else:
+                                        # Qwen got something but not valid - use if better than current
+                                        current_digits = len(re.sub(r'\D', '', final_data.get('aadharnumber', '')))
+                                        qwen_digits = len(re.sub(r'\D', '', value))
+                                        if qwen_digits > current_digits:
+                                            final_data['aadharnumber'] = value
+                                            logger.info(f"  ⚠️ Using Qwen's result (more digits): {value}")
+                                elif value and value not in ['Not Detected', 'Invalid Format', '']:
+                                    # Only process other fields if we didn't immediately reject
+                                    if not qwen_results.get('immediate_reject'):
+                                        final_data[field] = value
+                                        logger.info(f"  ✓ Updated {field} from Qwen: {value}")
+                            
                             used_qwen_fallback = True
-                            logger.info("✅ Qwen fallback completed successfully")
+                            logger.info("✅ Qwen fallback completed")
                         else:
-                            logger.warning("⚠️ Qwen fallback returned no results")
+                            logger.warning("⚠️ Qwen returned no results")
                             
                     except Exception as e:
                         logger.error(f"❌ Qwen fallback failed: {e}")
                         logger.error(traceback.format_exc())
             
-            # Final validation summary
+            # =====================================================================
+            # === FINAL VALIDATION (AFTER QWEN)
+            # =====================================================================
+            
+            # If Qwen already rejected due to masked Aadhaar, skip further validation
+            if qwen_detected_masked and final_data.get('aadhar_rejection_reason') == 'masked_aadhar':
+                logger.error(f"🚫 QWEN IMMEDIATE REJECTION - Skipping further validation")
+                logger.error(f"🚫 Final Status: REJECTED due to masked Aadhaar detected by Qwen")
+            else:
+                # Only do final validation if not already rejected by Qwen
+                final_aadhar = final_data.get('aadharnumber', '')
+                
+                # Check if final result is garbage
+                if final_aadhar and self._is_garbage_text(final_aadhar):
+                    logger.error(f"🗑️ FINAL AADHAAR is GARBAGE - cleaning up")
+                    digits_only = re.sub(r'\D', '', str(final_aadhar))
+                    if len(digits_only) >= 8:
+                        final_aadhar = digits_only
+                        final_data['aadharnumber'] = digits_only
+                    else:
+                        final_aadhar = ""
+                        final_data['aadharnumber'] = ""
+                
+                # NOW do final validation
+                is_valid, clean_aadhar, rejection_reason = self._validate_aadhaar_number(final_aadhar)
+                # 🚫 FINAL HARD BLOCK FOR MASKED AADHAAR
+                if rejection_reason == 'masked_aadhar':
+                    final_data['aadharnumber'] = clean_aadhar or final_aadhar
+                    final_data['aadhar_status'] = 'aadhar_disapproved'
+                    final_data['aadhar_rejection_reason'] = 'masked_aadhar'
+                    logger.error("🚫 HARD REJECT: Masked Aadhaar detected")
+                    return {
+                        "success": True,
+                        "data": final_data,
+                        "card_rotation": card_rotation,
+                        "used_qwen_fallback": False,
+                        "qwen_detected_masked": False
+                    }
+
+                
+                elif not is_valid:
+                    logger.error(f"🚫 FINAL VALIDATION FAILED: {rejection_reason}")
+                    if rejection_reason == 'masked_aadhar':
+                        final_data['aadharnumber'] = clean_aadhar if clean_aadhar else final_aadhar
+                    elif rejection_reason == 'invalid_length':
+                        final_data['aadharnumber'] = clean_aadhar if clean_aadhar else ""
+                    else:
+                        final_data['aadharnumber'] = clean_aadhar if clean_aadhar else ""
+                    
+                    final_data['aadhar_status'] = 'aadhar_disapproved'
+                    final_data['aadhar_rejection_reason'] = rejection_reason
+                else:
+                    logger.info(f"✅ FINAL VALIDATION PASSED: {clean_aadhar}")
+                    final_data['aadharnumber'] = clean_aadhar
+                    final_data['aadhar_status'] = 'aadhar_approved'
+                    if 'aadhar_rejection_reason' in final_data:
+                        del final_data['aadhar_rejection_reason']
+            
+            # === FINAL CLEANUP ===
+            final_aadhar_value = final_data.get('aadharnumber', '')
+            if final_aadhar_value:
+                if len(str(final_aadhar_value)) > 30 or '\n' in str(final_aadhar_value):
+                    logger.error(f"🗑️ Cleaning up garbage in final Aadhaar field")
+                    digits_only = re.sub(r'\D', '', str(final_aadhar_value))
+                    final_data['aadharnumber'] = digits_only if len(digits_only) <= 15 else ""
+            
+            # === SUMMARY ===
             logger.info("\n" + "=" * 60)
             logger.info("📋 FINAL EXTRACTION SUMMARY")
             logger.info("=" * 60)
@@ -469,12 +735,22 @@ class EntityAgent:
                 logger.info(f"Rejection Reason: {final_data.get('aadhar_rejection_reason')}")
             logger.info(f"DOB: {final_data.get('dob', 'N/A')}")
             logger.info(f"Age: {final_data.get('age', 'N/A')}")
-            logger.info(f"Age Status: {final_data.get('age_status', 'N/A')}")
             logger.info(f"Gender: {final_data.get('gender', 'N/A')}")
             logger.info(f"Card Rotation: {card_rotation}°")
             logger.info(f"Used Full Image Fallback: {has_missing}")
             logger.info(f"Used Qwen Fallback: {used_qwen_fallback}")
+            logger.info(f"Qwen Detected Masked: {qwen_detected_masked}")
             logger.info("=" * 60)
+            
+            # === FINAL SANITIZATION CHECK ===
+            if 'aadharnumber' in final_data:
+                aadhar_val = str(final_data['aadharnumber'])
+                if len(aadhar_val) > 20 or '\n' in aadhar_val or '\r' in aadhar_val:
+                    logger.error(f"🚨 SANITIZATION: Removing garbage Aadhaar from final response")
+                    final_data['aadharnumber'] = ""
+                    if final_data.get('aadhar_status') == 'aadhar_approved':
+                        final_data['aadhar_status'] = 'aadhar_disapproved'
+                        final_data['aadhar_rejection_reason'] = 'not_detected'
             
             return {
                 "success": True,
@@ -482,7 +758,8 @@ class EntityAgent:
                 "debug_dir": str(session_dir) if session_dir else None,
                 "card_rotation": card_rotation,
                 "used_fallback": has_missing,
-                "used_qwen_fallback": used_qwen_fallback
+                "used_qwen_fallback": used_qwen_fallback,
+                "qwen_detected_masked": qwen_detected_masked
             }
 
         except Exception as e:
@@ -490,12 +767,9 @@ class EntityAgent:
             return {"success": False, "error": str(e)}
 
     def detect_entities_in_image(self, image_input, confidence_threshold: float, card_side: str = 'front', session_dir: Path = None):
-        """
-        Modified to accept card_side parameter and filter entities accordingly.
-        """
-        logger.info(f"\nStep 1: Detecting entities in image (Side: {card_side}, Threshold: {confidence_threshold})")
+        """Detect entities with side-specific filtering"""
+        logger.info(f"\nStep 1: Detecting entities (Side: {card_side}, Threshold: {confidence_threshold})")
         
-        # Handle input type
         if isinstance(image_input, str):
             img = cv2.imread(str(image_input))
             input_name = Path(image_input).stem
@@ -508,7 +782,6 @@ class EntityAgent:
         if img is None:
             return {}
         
-        # Define entities based on card side
         if card_side.lower() == 'front':
             target_entities = {'aadharnumber', 'dob', 'gender', 'name', 'name_otherlang'}
         elif card_side.lower() == 'back':
@@ -516,9 +789,8 @@ class EntityAgent:
         else:
             target_entities = {'aadharnumber', 'dob', 'gender'}
         
-        logger.info(f"  Target entities for {card_side}: {target_entities}")
+        logger.info(f"  Target entities: {target_entities}")
         
-        # Run entity detection
         results = self.model2(img, device=self.device, verbose=False)
         card_detections = []
         
@@ -528,7 +800,6 @@ class EntityAgent:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             class_name = self.entity_classes.get(int(box.cls[0]), "unknown")
             
-            # Only process target entities
             if class_name not in target_entities:
                 continue
             
@@ -543,7 +814,6 @@ class EntityAgent:
         if not card_detections:
             return {}
 
-        # Wrap in original structure
         all_detections = {
             input_name: {
                 "card_image": img,
@@ -555,8 +825,8 @@ class EntityAgent:
         return all_detections
 
     def crop_entities(self, all_detections: Dict[str, Dict[str, Any]], session_dir: Path = None):
-        """Step 3: Crop individual entities with bounds checking"""
-        logger.info(f"\nStep 3: Cropping individual entities")
+        """Crop individual entities with bounds checking"""
+        logger.info(f"\nStep 3: Cropping entities")
         
         for card_name, card_data in all_detections.items():
             img = card_data['card_image']
@@ -565,34 +835,28 @@ class EntityAgent:
             for i, detection in enumerate(card_data['detections']):
                 x1, y1, x2, y2 = detection['bbox']
                 
-                # Sanitize bounds
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(w, x2), min(h, y2)
                 
                 if x2 <= x1 or y2 <= y1:
-                    logger.warning(f"  Invalid bbox for {detection['class_name']}, skipping")
+                    logger.warning(f"  Invalid bbox for {detection['class_name']}")
                     detection['cropped_image'] = None
                     continue
                 
                 crop = img[y1:y2, x1:x2]
                 detection['cropped_image'] = crop
-                entity_key = f"{card_name}_{detection['class_name']}_{i}"
-                detection['entity_key'] = entity_key
+                detection['entity_key'] = f"{card_name}_{detection['class_name']}_{i}"
         
         return all_detections
     
     def _preprocess_for_aadhaar_ocr(self, img: np.ndarray) -> List[Tuple[str, np.ndarray]]:
-        """
-        Specialized preprocessing for Aadhaar numbers which are often in specific fonts/formats.
-        """
+        """Specialized preprocessing for Aadhaar numbers"""
         try:
-            # Convert to grayscale if needed
             if len(img.shape) == 3:
                 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             else:
                 gray = img.copy()
             
-            # Resize if too small
             h, w = gray.shape
             if h < 50:
                 scale = 50 / h
@@ -601,22 +865,18 @@ class EntityAgent:
             
             preprocessed_versions = []
             
-            # Version 1: Simple threshold
             _, thresh1 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             preprocessed_versions.append(('otsu', thresh1))
             
-            # Version 2: Adaptive threshold
             thresh2 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                            cv2.THRESH_BINARY, 11, 2)
             preprocessed_versions.append(('adaptive', thresh2))
             
-            # Version 3: Enhanced contrast + threshold
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
             enhanced = clahe.apply(gray)
             _, thresh3 = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             preprocessed_versions.append(('clahe', thresh3))
             
-            # Version 4: Denoising + threshold
             denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
             _, thresh4 = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             preprocessed_versions.append(('denoised', thresh4))
@@ -624,14 +884,11 @@ class EntityAgent:
             return preprocessed_versions
             
         except Exception as e:
-            logger.warning(f"  Error in Aadhaar preprocessing: {e}")
+            logger.warning(f"  Aadhaar preprocessing error: {e}")
             return [('original', img)]
     
     def _extract_aadhaar_with_multiple_methods(self, img: np.ndarray) -> str:
-        """
-        Try multiple OCR methods specifically for Aadhaar numbers.
-        Returns the RAW OCR text (preserving X's for masked detection).
-        """
+        """Try multiple OCR methods for Aadhaar - preserves X for mask detection"""
         try:
             preprocessed_versions = self._preprocess_for_aadhaar_ocr(img)
             
@@ -673,27 +930,25 @@ class EntityAgent:
                             if score >= 12:
                                 return text
                                 
-                        except Exception as e:
+                        except:
                             continue
             
             return best_result
             
         except Exception as e:
-            logger.error(f"  Error in Aadhaar extraction: {e}")
+            logger.error(f"  Aadhaar extraction error: {e}")
             return ""
     
     def _correct_entity_orientation_and_preprocess(self, entity_image: np.ndarray, entity_key: str, class_name: str = None, osd_confidence_threshold: float = 0.5) -> Optional[Any]:
-        """
-        Enhanced preprocessing with special handling for Aadhaar numbers.
-        """
+        """Enhanced preprocessing with Aadhaar special handling"""
         try:
             img = entity_image
             if img is None or img.size == 0:
-                logger.warning(f"  Entity image data for {entity_key} is empty, skipping.")
+                logger.warning(f"  Empty image for {entity_key}")
                 return None
             
             if class_name == 'aadharnumber':
-                logger.info(f"  Using specialized Aadhaar preprocessing for {entity_key}")
+                logger.info(f"  Aadhaar preprocessing for {entity_key}")
                 return img
             
             h, w = img.shape[:2]
@@ -733,11 +988,11 @@ class EntityAgent:
             return Image.fromarray(cv2.cvtColor(corrected_img, cv2.COLOR_BGR2GRAY))
             
         except Exception as e:
-            logger.error(f"   Error during entity orientation/preprocessing for {entity_key}: {e}")
+            logger.error(f"   Orientation error for {entity_key}: {e}")
             return None
 
     def _detect_orientation_by_letters(self, img: np.ndarray, entity_key: str) -> Optional[int]:
-        """Detect orientation by analyzing letter shapes and OCR confidence"""
+        """Detect orientation by analyzing letter shapes"""
         try:
             rotations = [0, 90, 180, 270]
             rotation_scores = {}
@@ -762,7 +1017,7 @@ class EntityAgent:
                 return best_rotation
             return None
                 
-        except Exception as e:
+        except:
             return None
 
     def _calculate_orientation_score(self, img: np.ndarray, rotation: int) -> float:
@@ -777,14 +1032,13 @@ class EntityAgent:
             shape_score = self._analyze_letter_shapes(gray)
             line_score = self._analyze_text_lines(gray)
             
-            total_score = (ocr_score * 0.5 + shape_score * 0.3 + line_score * 0.2)
-            return total_score
+            return ocr_score * 0.5 + shape_score * 0.3 + line_score * 0.2
             
         except:
             return 0.0
 
     def _get_ocr_confidence_score(self, gray_img: np.ndarray) -> float:
-        """Get OCR confidence score"""
+        """Get OCR confidence"""
         try:
             psm_modes = [6, 7, 8, 13]
             best_confidence = 0.0
@@ -847,7 +1101,7 @@ class EntityAgent:
             return 0.0
 
     def _analyze_text_lines(self, gray_img: np.ndarray) -> float:
-        """Analyze text line orientation"""
+        """Analyze text lines"""
         try:
             _, binary = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
             
@@ -870,8 +1124,8 @@ class EntityAgent:
             return 0.5
 
     def perform_multi_language_ocr(self, all_detections: Dict[str, Dict[str, Any]]):
-        """Step 4: Perform OCR with specialized handling for Aadhaar"""
-        logger.info(f"\nStep 4: Performing Multi-Language OCR")
+        """OCR with Aadhaar special handling"""
+        logger.info(f"\nStep 4: Multi-Language OCR")
         ocr_results = {}
         
         for card_name, card_data in all_detections.items():
@@ -906,7 +1160,7 @@ class EntityAgent:
         return ocr_results
 
     def organize_results_by_card_type(self, all_detections: Dict[str, Dict[str, Any]], ocr_results: Dict[str, str], confidence_threshold: float):
-        """Step 5: Organize results"""
+        """Organize results by card type"""
         logger.info("\nStep 5: Organizing results")
         organized_results = {
             'front': {}, 'back': {},
@@ -938,13 +1192,17 @@ class EntityAgent:
         return organized_results
 
     def extract_main_fields(self, organized_results: Dict[str, Any]) -> Dict[str, Any]:
-        """Extract and validate main fields with STRICT masked Aadhaar rejection"""
+        """
+        Extract and validate main fields with ULTRA STRICT masked Aadhaar rejection.
+        NO COMPROMISES - masked Aadhaar is ALWAYS rejected.
+        """
         fields = ['aadharnumber', 'dob', 'gender']
         data = {key: "" for key in fields}
         
         aadhar_front = ""
         aadhar_back = ""
         
+        # Extract raw OCR text from both sides
         for side in ['front', 'back']:
             for card in organized_results.get(side, {}).values():
                 for field in fields:
@@ -978,77 +1236,74 @@ class EntityAgent:
                             if first_valid_text:
                                 data[field] = first_valid_text
         
-        # === CRITICAL: Check for Masked Aadhaar FIRST ===
+        # === CRITICAL SECTION: AADHAAR VALIDATION ===
         logger.info("=" * 60)   
-        logger.info("🔍 CHECKING FOR MASKED AADHAAR")
+        logger.info("🔍 STRICT AADHAAR VALIDATION")
         logger.info("=" * 60)
-        logger.info(f"Aadhar Front (RAW): '{aadhar_front}'")
-        logger.info(f"Aadhar Back (RAW): '{aadhar_back}'")
+        logger.info(f"Front RAW: '{aadhar_front}'")
+        logger.info(f"Back RAW: '{aadhar_back}'")
         
-        is_masked_front = self._is_masked_aadhaar(aadhar_front)
-        is_masked_back = self._is_masked_aadhaar(aadhar_back)
+        # Check BOTH front and back for masking
+        front_masked = self._is_masked_aadhaar(aadhar_front) if aadhar_front else False
+        back_masked = self._is_masked_aadhaar(aadhar_back) if aadhar_back else False
         
-        if is_masked_front or is_masked_back:
-            masked_source = 'front' if is_masked_front else 'back'
-            if is_masked_front and is_masked_back:
-                masked_source = 'both'
+        if front_masked or back_masked:
+            masked_source = []
+            if front_masked:
+                masked_source.append('front')
+            if back_masked:
+                masked_source.append('back')
             
-            logger.error(f"🚫 REJECTING: Masked Aadhaar detected in {masked_source}")
+            logger.error(f"🚫 REJECTION: Masked Aadhaar in {', '.join(masked_source)}")
             
-            # Store the masked value
+            # Use whichever value we have (even if masked) to show what was detected
             data['aadharnumber'] = aadhar_front if aadhar_front else aadhar_back
             data['aadhar_status'] = "aadhar_disapproved"
             data['aadhar_rejection_reason'] = "masked_aadhar"
             
-            # Continue processing DOB and gender but Aadhaar is REJECTED
+            logger.error(f"🚫 FINAL: Rejected with value '{data['aadharnumber']}'")
         else:
-            logger.info("✅ No masking detected")
+            logger.info("✅ No masking detected, proceeding with validation")
             
-            # Process Aadhaar normally
+            # Choose best Aadhaar between front and back
             best_aadhar = ""
-            aadhar_front_digits = re.sub(r'\D', '', aadhar_front) if aadhar_front else ""
-            aadhar_back_digits = re.sub(r'\D', '', aadhar_back) if aadhar_back else ""
+            front_digits = re.sub(r'\D', '', aadhar_front) if aadhar_front else ""
+            back_digits = re.sub(r'\D', '', aadhar_back) if aadhar_back else ""
             
-            if aadhar_front_digits == aadhar_back_digits and aadhar_front_digits:
-                best_aadhar = aadhar_front_digits
+            # Prefer matching values
+            if front_digits == back_digits and front_digits:
+                best_aadhar = front_digits
+            # Prefer 12-digit values
+            elif len(front_digits) == 12:
+                best_aadhar = front_digits
+            elif len(back_digits) == 12:
+                best_aadhar = back_digits
+            # Prefer longer values
+            elif len(front_digits) > len(back_digits):
+                best_aadhar = front_digits
+            elif len(back_digits) > len(front_digits):
+                best_aadhar = back_digits
+            elif front_digits:
+                best_aadhar = front_digits
+            elif back_digits:
+                best_aadhar = back_digits
+            
+            # Validate using strict method
+            is_valid, clean_aadhar, rejection_reason = self._validate_aadhaar_number(best_aadhar)
+            
+            data['aadharnumber'] = clean_aadhar if clean_aadhar else best_aadhar
+            
+            if is_valid:
+                data['aadhar_status'] = "aadhar_approved"
+                logger.info(f"✅ APPROVED: {clean_aadhar}")
             else:
-                if len(aadhar_front_digits) == 12:
-                    best_aadhar = aadhar_front_digits
-                elif len(aadhar_back_digits) == 12:
-                    best_aadhar = aadhar_back_digits
-                elif len(aadhar_front_digits) > len(aadhar_back_digits):
-                    best_aadhar = aadhar_front_digits
-                elif len(aadhar_back_digits) > len(aadhar_front_digits):
-                    best_aadhar = aadhar_back_digits
-                elif aadhar_front_digits:
-                    best_aadhar = aadhar_front_digits
-                elif aadhar_back_digits:
-                    best_aadhar = aadhar_back_digits
-            
-            data['aadharnumber'] = best_aadhar
-            
-            # Validate Aadhaar
-            aadhar_status = "aadhar_approved"
-            aadhar_rejection_reason = None
-            
-            if data.get('aadharnumber'):
-                aad_digits_only = re.sub(r'\D', '', data['aadharnumber'])
-                
-                if len(aad_digits_only) == 12:
-                    data['aadharnumber'] = aad_digits_only
-                else:
-                    aadhar_status = "aadhar_disapproved"
-                    aadhar_rejection_reason = "invalid_length"
-                    data['aadharnumber'] = aad_digits_only
-            else:
-                aadhar_status = "aadhar_disapproved"
-                aadhar_rejection_reason = "not_detected"
-            
-            data['aadhar_status'] = aadhar_status
-            if aadhar_rejection_reason:
-                data['aadhar_rejection_reason'] = aadhar_rejection_reason
+                data['aadhar_status'] = "aadhar_disapproved"
+                data['aadhar_rejection_reason'] = rejection_reason
+                logger.error(f"🚫 REJECTED: {rejection_reason} - '{data['aadharnumber']}'")
         
-        # DOB Processing
+        logger.info("=" * 60)
+        
+        # === DOB Processing ===
         age_status = "age_disapproved"
         
         if data.get('dob'):
@@ -1074,7 +1329,7 @@ class EntityAgent:
         
         data['age_status'] = age_status
         
-        # Gender normalization
+        # === Gender Normalization ===
         if data['gender']:
             gender = data['gender'].strip().lower()
             gender = re.sub(r'[^a-z]', '', gender)
