@@ -17,8 +17,9 @@ pydantic
 python-dotenv
 requests
 transformers
+accelerate
+qwen-vl-utils
 brotlipy
-requests
 cloudscraper
 gspread
 redis
