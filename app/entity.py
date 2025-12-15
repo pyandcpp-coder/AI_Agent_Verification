@@ -367,12 +367,12 @@ class EntityAgent:
                         logger.warning(f"  ⚠️ Using full image {field} (more digits): {full_clean}")
                         merged[field] = full_clean
                         # Keep rejection info but let Qwen verify later
-                        # 🚫 HARD STOP for masked Aadhaar
+                        # HARD STOP for masked Aadhaar
                         if full_reason == 'masked_aadhar' or cropped_reason == 'masked_aadhar':
                             merged['aadharnumber'] = full_value or cropped_value
                             merged['aadhar_status'] = 'aadhar_disapproved'
                             merged['aadhar_rejection_reason'] = 'masked_aadhar'
-                            return merged  # ⛔ STOP HERE
+                            return merged  #STOP HERE
 
                 
                 elif full_value and full_value not in ['Invalid Format', 'Not Detected', 'Other', '']:
@@ -575,7 +575,7 @@ class EntityAgent:
                         )
                         
                         if qwen_results:
-                            # Validate Qwen Aadhaar result with STRICT checks
+
                             if 'aadharnumber' in qwen_results:
                                 qwen_aadhar = qwen_results['aadharnumber']
                                 logger.info(f"🔍 Qwen returned Aadhaar: '{qwen_aadhar[:100]}...'")
