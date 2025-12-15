@@ -44,20 +44,27 @@ class VerificationScorer:
             score += face_points
             breakdown["face_score"] = round(face_points, 2)
 
-        # --- 2. Aadhaar Validity & Masking (0 - 20 points) ---
+        # --- 2. Aadhaar Validity & Masking (0 - 30 points) ---
         aadhaar_num = entity_data.get("aadharnumber", "").replace(" ", "")
+        aadhaar_original = entity_data.get("aadharnumber", "")
         
-        # Check for Masking
-        if "X" in entity_data.get("aadharnumber", "").upper():
-            # Masked Aadhaar is generally acceptable, but can be flagged if needed
-            pass 
+        # Check for Masking or Invalid Aadhaar
+        is_masked = "X" in aadhaar_original.upper()
+        is_invalid = not (len(aadhaar_num) == 12 and aadhaar_num.isdigit())
+        
+        if is_masked or is_invalid:
+            # Masked or Invalid Aadhaar -> Critical Failure (Auto REJECT)
+            breakdown["aadhar_score"] = 0
+            critical_failure = True
             
-        if len(aadhaar_num) == 12 and aadhaar_num.isdigit():
+            if is_masked:
+                rejection_reasons.append(f"Masked Aadhaar Number Detected ({aadhaar_original})")
+            else:
+                rejection_reasons.append("Invalid/Unreadable Aadhaar Number")
+        else:
+            # Valid 12-digit Aadhaar
             score += self.weights["aadhar"]
             breakdown["aadhar_score"] = self.weights["aadhar"]
-        else:
-            breakdown["aadhar_score"] = 0
-            rejection_reasons.append("Invalid/Unreadable Aadhaar Number")
 
         # --- 3. DOB & Age Check (0 - 20 points) ---
         extracted_dob = entity_data.get("dob", "")
@@ -84,7 +91,6 @@ class VerificationScorer:
             else:
                 dob_score = self.weights["dob"]
         else:
-            # Under 18 or Invalid DOB -> Critical Failure
             dob_score = 0
             critical_failure = True
             rejection_reasons.append("User is Under 18 or DOB Unreadable")
