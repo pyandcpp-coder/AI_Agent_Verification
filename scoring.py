@@ -21,6 +21,25 @@ class VerificationScorer:
             except ValueError:
                 continue
         return None
+    
+    def _extract_year(self, dob_string):
+        """Extract year from DOB string - handles both full dates and year-only formats"""
+        if not dob_string:
+            return None
+        
+        dob_str = str(dob_string).strip()
+        
+        # Try to parse as full date first
+        normalized = self._normalize_dob(dob_str)
+        if normalized:
+            return normalized.split('-')[0]  # Extract year from yyyy-mm-dd
+        
+        # If not a full date, look for a 4-digit year
+        year_match = re.search(r'\b(19|20)\d{2}\b', dob_str)
+        if year_match:
+            return year_match.group(0)
+        
+        return None
 
     def calculate_score(self, face_data, entity_data, expected_gender, expected_dob=None):
         score = 0
@@ -73,22 +92,25 @@ class VerificationScorer:
         dob_score = 0
         # Rule A: Must be 18+
         if age_status == "age_approved":
-            # Rule B: If Input DOB provided, it MUST match Aadhaar DOB
+            # Rule B: If Input DOB provided, it MUST match Aadhaar DOB (YEAR-BASED MATCHING)
             if expected_dob and extracted_dob:
-                norm_input = self._normalize_dob(expected_dob)
-                norm_extracted = self._normalize_dob(extracted_dob)
+                input_year = self._extract_year(expected_dob)
+                extracted_year = self._extract_year(extracted_dob)
                 
-                if norm_input and norm_extracted and norm_input == norm_extracted:
-                    dob_score = self.weights["dob"]
-                elif norm_input and norm_extracted:
-                    # DOB Mismatch -> Critical Failure
-                    dob_score = 0
-                    critical_failure = True
-                    rejection_reasons.append(f"DOB Mismatch (Input: {expected_dob} vs Aadhaar: {extracted_dob})")
+                if input_year and extracted_year:
+                    if input_year == extracted_year:
+                        # Year matches - PASS
+                        dob_score = self.weights["dob"]
+                    else:
+                        # Year Mismatch -> Critical Failure
+                        dob_score = 0
+                        critical_failure = True
+                        rejection_reasons.append(f"Birth Year Mismatch (Input Year: {input_year} vs Aadhaar Year: {extracted_year})")
                 else:
-                    # Format error but Age approved -> Pass
+                    # Could not extract year from one or both - If Age approved, give benefit of doubt
                     dob_score = self.weights["dob"]
             else:
+                # No expected_dob provided or no extracted_dob - If Age approved, pass
                 dob_score = self.weights["dob"]
         else:
             dob_score = 0
