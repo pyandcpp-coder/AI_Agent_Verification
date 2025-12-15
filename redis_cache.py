@@ -149,15 +149,39 @@ class RedisVerificationCache:
         api_response: Optional[Dict[str, Any]] = None
     ) -> bool:
         """
-        Store verification result in cache.
+        Store verification result in cache with API response.
+        
+        This method stores both the AI verification result and the API response 
+        from pushing the result to the main server. This allows for complete 
+        tracking of the entire verification workflow.
         
         Args:
-            user_id: User ID
-            verification_result: Verification result from AI processing
-            api_response: Response from the POST API (optional)
+            user_id: User ID being verified
+            verification_result: Verification result from AI processing (decision, scores, etc.)
+            api_response: Response from the main server API after pushing the result
+                         Includes status, message, success flag, etc. from the server
             
         Returns:
             True if stored successfully, False otherwise
+            
+        Example:
+            verification_result = {
+                "final_decision": "APPROVED",
+                "score": 95,
+                "breakdown": {...},
+                "extracted_data": {...}
+            }
+            
+            api_response = {
+                "success": true,
+                "message": "KYC verified successfully"
+            }
+            
+            or on failure:
+            api_response = {
+                "success": false,
+                "message": "Its not a pending status KYC"
+            }
         """
         if not self.enabled:
             return False
@@ -165,11 +189,11 @@ class RedisVerificationCache:
         try:
             key = self._make_key(user_id)
             
-            # Prepare cache entry
+            # Prepare cache entry with both verification result and API response
             cache_entry = {
                 'user_id': user_id,
                 'verification_result': verification_result,
-                'api_response': api_response,
+                'api_response': api_response,  # Store the server response
                 'cached_at': datetime.now().isoformat(),
                 'ttl_hours': self.ttl_seconds / 3600
             }
@@ -181,9 +205,18 @@ class RedisVerificationCache:
                 json.dumps(cache_entry)
             )
             
-            logger.info(f"💾 Stored verification result for user {user_id} (TTL: {self.ttl_seconds/3600}h)")
+            # Log with API response details if available
+            if api_response:
+                api_status = api_response.get("success", api_response.get("status_code"))
+                api_msg = api_response.get("message", "API response received")
+                logger.info(f"💾 Stored user {user_id} with API response: {api_msg} (TTL: {self.ttl_seconds/3600}h)")
+            else:
+                logger.info(f"💾 Stored verification result for user {user_id} (TTL: {self.ttl_seconds/3600}h)")
             return True
             
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ Error encoding cache data for user {user_id}: {e}")
+            return False
         except Exception as e:
             logger.error(f"❌ Error storing cache for user {user_id}: {e}")
             return False

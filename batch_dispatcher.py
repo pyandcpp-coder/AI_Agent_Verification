@@ -613,6 +613,9 @@ async def process_single_user(session, user, session_dir, agent_id):
         }
         
         push_start_time = time.time()
+        push_api_response = None
+        push_success = False
+        
         try:
             async with session.post(push_url, json=push_payload, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=25)) as push_resp:
                 push_elapsed = time.time() - push_start_time
@@ -626,10 +629,25 @@ async def process_single_user(session, user, session_dir, agent_id):
                     "timestamp": datetime.now().isoformat()
                 }
                 
-                if push_resp.status == 200:
+                # Try to parse response JSON regardless of status
+                try:
                     push_result = await push_resp.json()
+                    push_api_response = push_result
                     push_call_log["response"] = push_result
+                except:
+                    # If JSON parsing fails, get text response
+                    error_text = await push_resp.text()
+                    push_api_response = {
+                        "status_code": push_resp.status,
+                        "error": error_text,
+                        "message": error_text
+                    }
+                    push_call_log["response"] = push_api_response
+                
+                if push_resp.status == 200:
+                    push_result = push_call_log.get("response", {})
                     user_log["api_calls"].append(push_call_log)
+                    push_success = True
                     
                     user_log["processing_steps"].append({
                         "step": "4_result_pushed",
@@ -652,17 +670,8 @@ async def process_single_user(session, user, session_dir, agent_id):
                         decision_log += f" | Reasons: {', '.join(push_payload['rejection_reasons'])}"
                     logger.info(f"✅ User {user_id}: Processed & Pushed ({decision_log})")
                     
-                    # Store in Redis cache after successful push
-                    redis_cache = get_cache()
-                    if redis_cache.enabled:
-                        redis_cache.store_verification_result(
-                            user_id=str(user_id),
-                            verification_result=ai_result,
-                            api_response=push_result
-                        )
                 else:
-                    error_text = await push_resp.text()
-                    push_call_log["error"] = error_text
+                    push_result = push_call_log.get("response", {})
                     user_log["api_calls"].append(push_call_log)
                     user_log["errors"].append(f"Push failed: Status {push_resp.status}")
                     
@@ -672,14 +681,21 @@ async def process_single_user(session, user, session_dir, agent_id):
                         "status": "failed",
                         "message": f"Failed to push result to main server",
                         "status_code": push_resp.status,
-                        "error": error_text
+                        "api_response": push_result,
+                        "error": push_result.get("error") if isinstance(push_result, dict) else str(push_result)
                     })
                     
-                    logger.error(f" User {user_id}: Failed to Push Result {push_resp.status} - {error_text[:100]}")
+                    api_error_msg = push_result.get("message") if isinstance(push_result, dict) else str(push_result)[:100]
+                    logger.error(f" User {user_id}: Failed to Push Result {push_resp.status} - {api_error_msg}")
                     
         except Exception as push_error:
             push_elapsed = time.time() - push_start_time
             user_log["errors"].append(f"Push exception: {str(push_error)}")
+            push_api_response = {
+                "status_code": -1,
+                "error": str(push_error),
+                "message": f"Exception during push: {str(push_error)}"
+            }
             user_log["processing_steps"].append({
                 "step": "4_result_pushed",
                 "timestamp": datetime.now().isoformat(),
@@ -690,7 +706,7 @@ async def process_single_user(session, user, session_dir, agent_id):
             })
             logger.error(f" User {user_id}: Push Exception - {push_error}")
         
-        # Store final result with detailed breakdown
+        # Store final result with detailed breakdown and API response
         user_log["final_result"] = {
             "final_decision": ai_result.get("final_decision", "REJECTED"),
             "status_code": ai_result.get("status_code", 0),
@@ -698,6 +714,8 @@ async def process_single_user(session, user, session_dir, agent_id):
             "breakdown": ai_result.get("breakdown", {}),
             "extracted_data": ai_result.get("extracted_data", {}),
             "rejection_reasons": ai_result.get("rejection_reasons", []),
+            "api_response": push_api_response,  # Store API response here
+            "api_push_success": push_success,   # Track if push was successful
             "decision_summary": {
                 "is_approved": ai_result.get("final_decision") == "APPROVED",
                 "is_rejected": ai_result.get("final_decision") == "REJECTED",
@@ -748,6 +766,19 @@ async def process_single_user(session, user, session_dir, agent_id):
     # Save the comprehensive log
     save_user_log(user_id, user_log, session_dir)
     current_session["users_processed"].append(user_id)
+    
+    # Store in Redis cache with API response for ALL cases (success, failure, errors)
+    redis_cache = get_cache()
+    if redis_cache.enabled:
+        try:
+            redis_cache.store_verification_result(
+                user_id=str(user_id),
+                verification_result=ai_result if 'ai_result' in locals() else user_log["final_result"],
+                api_response=push_api_response if push_api_response else user_log["final_result"].get("api_response")
+            )
+            logger.info(f"💾 Stored user {user_id} to Redis cache with API response")
+        except Exception as redis_error:
+            logger.error(f"⚠️  Failed to store user {user_id} in Redis: {redis_error}")
     
     # Log to Google Sheets if enabled
     if google_sheet_logger:
