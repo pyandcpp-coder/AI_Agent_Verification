@@ -14,6 +14,7 @@ import pytesseract
 import torch
 from PIL import Image
 from ultralytics import YOLO
+from app.qwen_fallback import QwenFallbackAgent
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -27,6 +28,7 @@ class EntityAgent:
         else:
             self.device = "cpu"
             logger.info("CUDA not available. Models will fall back to CPU.")
+
 
         self.model1_path = model1_path
         self.model2_path = model2_path
@@ -57,6 +59,18 @@ class EntityAgent:
         self._check_tesseract()
 
         logger.info("YOLOv8 models loaded successfully.")
+
+        self.enable_qwen_fallback = enable_qwen_fallback
+        self.qwen_agent = None
+        
+        if self.enable_qwen_fallback:
+            try:
+                logger.info("Initializing Qwen3-VL fallback agent...")
+                self.qwen_agent = QwenFallbackAgent()
+                logger.info("Qwen3-VL fallback agent ready")
+            except Exception as e:
+                logger.warning(f"Could not initialize Qwen fallback: {e}")
+                self.enable_qwen_fallback = False
         
         # Safely get names if models loaded
         if hasattr(self, 'model1'):
@@ -80,6 +94,44 @@ class EntityAgent:
              logger.critical(f"An error occurred while checking Tesseract: {e}")
              raise RuntimeError(f"Error checking Tesseract: {e}")
 
+    def _is_garbage_text(self, text: str) -> bool:
+        if not text: return True
+        text_str = str(text).strip()
+        if len(text_str) > 50 or '\n' in text_str: return True
+        non_alphanum = sum(1 for c in text_str if not c.isalnum() and c not in [' ', '-'])
+        if non_alphanum > 5: return True
+        digits = sum(1 for c in text_str if c.isdigit())
+        if len(text_str) > 0 and (digits / len(text_str) < 0.5): return True
+        return False
+
+    def _is_masked_aadhaar(self, text: str) -> bool:
+        if not text: return False
+        text_upper = str(text).upper()
+        # Check for X's or asterisks
+        if 'X' in text_upper or '*' in text_upper:
+            logger.error(f"🚫 MASKED AADHAAR DETECTED: '{text}'")
+            return True
+        return False
+
+    def _validate_aadhaar_number(self, text: str) -> tuple:
+        if not text: return False, "", "not_detected"
+        text_str = str(text).strip()
+        
+        if self._is_masked_aadhaar(text_str):
+            return False, text_str, "masked_aadhar"
+            
+        if self._is_garbage_text(text_str):
+            # Try to salvage digits
+            digits_only = re.sub(r'\D', '', text_str)
+            if len(digits_only) == 12:
+                return True, digits_only, None
+            return False, "", "invalid_format"
+            
+        digits_only = re.sub(r'\D', '', text_str)
+        if len(digits_only) != 12:
+            return False, digits_only, "invalid_length"
+            
+        return True, digits_only, None
     def detect_and_crop_cards(self, image_paths: List[str], confidence_threshold: float) -> Dict[str, List[Dict[str, Any]]]:
         """Step 1: Detect Aadhaar front/back cards and pass cropped image data (np.array) forward."""
         logger.info(f"\nStep 1: Detecting Aadhaar cards in {len(image_paths)} images (Threshold: {confidence_threshold})")
@@ -259,7 +311,7 @@ class EntityAgent:
             return total_score
             
         except Exception as e:
-            logger.debug(f"      Error calculating orientation score: {e}")
+            logger.debug(f"Error calculating orientation score: {e}")
             return 0.0
 
     def _get_ocr_confidence_score(self, gray_img: np.ndarray) -> float:
@@ -422,6 +474,62 @@ class EntityAgent:
             # Step 6: Extract Main Fields
             final_data = self.extract_main_fields(organized_results)
 
+            # --- QWEN FALLBACK LOGIC START ---
+            if self.enable_qwen_fallback and self.qwen_agent:
+                # 1. Validate Aadhaar
+                aadhaar = final_data.get('aadharnumber', '')
+                is_valid_aadhaar, clean_aadhaar, rejection_reason = self._validate_aadhaar_number(aadhaar)
+                
+                # 2. Check Masking - Immediate Rejection
+                if rejection_reason == 'masked_aadhar':
+                    final_data['aadhar_status'] = 'masked_aadhar'
+                    logger.info("🚫 Masked Aadhaar detected in OCR - Skipping Qwen to avoid false positives")
+                
+                else:
+                    # 3. Determine if Qwen is needed
+                    # We need Qwen if: Aadhaar is invalid OR DOB missing OR Gender missing
+                    missing_fields = []
+                    if not is_valid_aadhaar: missing_fields.append('aadharnumber')
+                    
+                    dob = final_data.get('dob', '')
+                    if dob in ['Invalid Format', 'Not Detected', '', None]: missing_fields.append('dob')
+                    
+                    gender = final_data.get('gender', '')
+                    if gender in ['Other', 'Not Detected', '', None]: missing_fields.append('gender')
+
+                    if missing_fields:
+                        logger.info(f"🔄 Triggering Qwen Fallback for: {missing_fields}")
+                        # Use the first image (Front) for Qwen
+                        front_image_path = image_paths[0] if image_paths else None
+                        
+                        if front_image_path:
+                            try:
+                                qwen_results = self.qwen_agent.extract_fields(front_image_path, missing_fields, 'front')
+                                
+                                # Merge Qwen Results
+                                if 'aadharnumber' in qwen_results:
+                                    q_aadhaar = qwen_results['aadharnumber']
+                                    if self._is_masked_aadhaar(q_aadhaar):
+                                        final_data['aadhar_status'] = 'masked_aadhar'
+                                        final_data['aadharnumber'] = q_aadhaar
+                                    else:
+                                        # Validate Qwen Aadhaar
+                                        q_valid, q_clean, _ = self._validate_aadhaar_number(q_aadhaar)
+                                        if q_valid:
+                                            final_data['aadharnumber'] = q_clean
+                                            # If OCR failed but Qwen succeeded, status is good
+                                            if final_data.get('aadhar_status') != 'masked_aadhar':
+                                                final_data['aadhar_status'] = 'extracted'
+
+                                if 'dob' in qwen_results and qwen_results['dob']:
+                                    final_data['dob'] = qwen_results['dob']
+                                
+                                if 'gender' in qwen_results and qwen_results['gender']:
+                                    final_data['gender'] = qwen_results['gender']
+                                    
+                            except Exception as e:
+                                logger.error(f"❌ Qwen Fallback Failed: {e}")
+
             if verbose:
                 logger.info(f"[user_id={user_id}] Pipeline processing completed successfully in memory.")
             
@@ -452,9 +560,8 @@ class EntityAgent:
             aad = data['aadharnumber']
             # detect masked aadhaar
             if re.search(r'X{4}', aad, re.IGNORECASE):
-                data['aadhar_status'] = "masked_aadhar" # Avoid returning simple string, update dict
+                data['aadhar_status'] = "masked_aadhar" 
             
-            # clean spaces for real aadhaar
             data['aadharnumber'] = aad.replace(" ", "")
         
         if data.get('dob'):
@@ -488,6 +595,6 @@ class EntityAgent:
 if __name__ == "__main__":
     try:
         agent = EntityAgent(model1_path="models/best4.pt", model2_path="models/best.pt")
-        print("✅ Entity Agent initialized successfully")
+        print("Entity Agent initialized successfully")
     except Exception as e:
-        print(f"❌ Initialization failed: {e}")
+        print(f"Initialization failed: {e}")

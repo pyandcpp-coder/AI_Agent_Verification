@@ -23,6 +23,7 @@ try:
     from app.entity import EntityAgent
     from app.gender_pipeline import GenderPipeline
     from scoring import VerificationScorer
+    # from app.qwen_fallback import QwenFallbackAgent
 
     from redis_cache import get_cache 
 except ImportError as e:
