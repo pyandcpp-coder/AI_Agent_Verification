@@ -7,7 +7,8 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, HttpUrl
 from entity import EntityAgent
-
+import pickle
+import 
 # ------------------ CONFIG ------------------
 
 UPLOAD_ROOT = "uploads"
@@ -230,4 +231,4 @@ async def extract_aadhaar(payload: AadhaarRequest):
 # ------------------ RUN ------------------
 
 if __name__ == "__main__":
-    uvicorn.run("entityCheck:app", host="0.0.0.0", port=8001)
+    uvicorn.run("entityCheck:app", host="0.0.0.0", port=8101)

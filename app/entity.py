@@ -4,6 +4,8 @@ import os
 import re
 import sys
 import traceback
+import pickle
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -21,7 +23,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class EntityAgent:
-    def __init__(self, model1_path="models/best4.pt", model2_path="models/best.pt", other_lang_code='hin+tel+ben', enable_qwen_fallback=True):
+    def __init__(self, model1_path="models/best4.pt", model2_path="models/best.pt", other_lang_code='hin+tel+ben', enable_qwen_fallback=True, aadhaar_db_path="aadhaar_records.pkl"):
         if torch.cuda.is_available():
             self.device = "cuda"
             logger.info(f"CUDA is available. Models will run on GPU ({torch.cuda.get_device_name(0)}).")
@@ -29,6 +31,10 @@ class EntityAgent:
             self.device = "cpu"
             logger.info("CUDA not available. Models will fall back to CPU.")
 
+        # Duplicate checking setup
+        self.aadhaar_db_path = aadhaar_db_path
+        self.aadhaar_lock = threading.Lock()
+        logger.info(f"Duplicate checking enabled with database: {self.aadhaar_db_path}")
 
         self.model1_path = model1_path
         self.model2_path = model2_path
@@ -94,6 +100,60 @@ class EntityAgent:
              logger.critical(f"An error occurred while checking Tesseract: {e}")
              raise RuntimeError(f"Error checking Tesseract: {e}")
 
+    # ------------------ DUPLICATE CHECKING FUNCTIONS ------------------
+    
+    def _load_aadhaar_db(self):
+        """Load existing Aadhaar records from pickle file"""
+        if not os.path.exists(self.aadhaar_db_path):
+            logger.info(f"No existing Aadhaar database found. Creating new one at {self.aadhaar_db_path}")
+            return {}
+        with open(self.aadhaar_db_path, "rb") as f:
+            db = pickle.load(f)
+            logger.info(f"Loaded {len(db)} records from Aadhaar database")
+            return db
+
+    def _save_aadhaar_db(self, db):
+        """Save Aadhaar records to pickle file"""
+        with open(self.aadhaar_db_path, "wb") as f:
+            pickle.dump(db, f)
+        logger.info(f"Saved {len(db)} records to Aadhaar database")
+
+    def _check_and_save_aadhaar(self, aadharnumber, gender, dob):
+        """
+        Check if Aadhaar number exists in database.
+        If duplicate, return existing record.
+        If new, save to database.
+        
+        Returns:
+          (is_duplicate: bool, existing_record: dict | None)
+        """
+        if not aadharnumber:
+            logger.warning("Cannot check duplicate: Aadhaar number is empty")
+            return False, None
+
+        with self.aadhaar_lock:  # Thread-safe operation
+            db = self._load_aadhaar_db()
+
+            # Check if Aadhaar number already exists
+            if aadharnumber in db:
+                logger.warning(f"🚫 DUPLICATE AADHAAR DETECTED: {aadharnumber}")
+                logger.warning(f"   Original submission: {db[aadharnumber]['timestamp']}")
+                return True, db[aadharnumber]
+
+            # Save new record
+            db[aadharnumber] = {
+                "aadharnumber": aadharnumber,
+                "gender": gender,
+                "dob": dob,
+                "timestamp": datetime.now().isoformat()
+            }
+            self._save_aadhaar_db(db)
+            logger.info(f"✅ New Aadhaar record saved: {aadharnumber}")
+
+        return False, None
+
+    # ------------------ VALIDATION FUNCTIONS ------------------
+
     def _is_garbage_text(self, text: str) -> bool:
         if not text: return True
         text_str = str(text).strip()
@@ -132,6 +192,9 @@ class EntityAgent:
             return False, digits_only, "invalid_length"
             
         return True, digits_only, None
+
+    # ------------------ DETECTION AND PROCESSING METHODS ------------------
+
     def detect_and_crop_cards(self, image_paths: List[str], confidence_threshold: float) -> Dict[str, List[Dict[str, Any]]]:
         """Step 1: Detect Aadhaar front/back cards and pass cropped image data (np.array) forward."""
         logger.info(f"\nStep 1: Detecting Aadhaar cards in {len(image_paths)} images (Threshold: {confidence_threshold})")
@@ -545,6 +608,37 @@ class EntityAgent:
                             except Exception as e:
                                 logger.error(f"❌ Qwen Fallback Failed: {e}")
 
+            # --- DUPLICATE CHECK START ---
+            # Only check duplicates if we have a valid Aadhaar number
+            aadhaar_num = final_data.get('aadharnumber', '')
+            if aadhaar_num and final_data.get('aadhar_status') != 'masked_aadhar':
+                is_duplicate, existing_record = self._check_and_save_aadhaar(
+                    aadhaar_num,
+                    final_data.get('gender', ''),
+                    final_data.get('dob', '')
+                )
+                
+                if is_duplicate:
+                    # REJECT THE SUBMISSION - Return error response
+                    logger.error(f"❌ SUBMISSION REJECTED: Duplicate Aadhaar detected - {aadhaar_num}")
+                    return {
+                        'error': 'duplicate_aadhar_detected',
+                        'success': False,
+                        'duplicate': True,
+                        'aadharnumber': aadhaar_num,
+                        'existing_record': existing_record,
+                        'message': f'This Aadhaar number ({aadhaar_num}) has already been submitted on {existing_record["timestamp"]}. Duplicate submissions are not allowed.'
+                    }
+                else:
+                    # New record - mark as accepted
+                    final_data['duplicate'] = False
+                    final_data['existing_record'] = None
+                    logger.info(f"✅ Submission accepted: New Aadhaar number")
+            else:
+                final_data['duplicate'] = False
+                final_data['existing_record'] = None
+            # --- DUPLICATE CHECK END ---
+
             if verbose:
                 logger.info(f"[user_id={user_id}] Pipeline processing completed successfully in memory.")
             
@@ -635,4 +729,4 @@ if __name__ == "__main__":
         agent = EntityAgent(model1_path="models/best4.pt", model2_path="models/best.pt")
         print("Entity Agent initialized successfully")
     except Exception as e:
-        print(f"Initialization failed: {e}")# import logging
+        print(f"Initialization failed: {e}")

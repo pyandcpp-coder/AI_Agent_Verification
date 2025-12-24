@@ -51,10 +51,11 @@ class VerificationScorer:
         face_sim = face_data.get("score", 0)
         low_face_sim = False
         
-        if face_sim < 5:
+        if face_sim < 20 :
             # Very low face similarity - Give 0 points and flag for review
             breakdown["face_score"] = 0
             low_face_sim = True
+            critical_failure = True
             rejection_reasons.append(f"Low Face Similarity (Similarity: {face_sim:.2f}%)")
         else:
             # Between 5% and 100% -> Scale linearly to 0-20 points
