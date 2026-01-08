@@ -1,0 +1,72 @@
+
+[1m[0;34m▶ Step 1: System Cleanup[0m
+Stopping existing processes...
+[0;32m✓[0m Stopped all processes
+Cleaning temporary files...
+[0;32m✓[0m Cleaned temporary files
+
+[1m[0;34m▶ Step 2: Checking Prerequisites[0m
+[0;32m✓[0m Python 3.11.8 found
+[0;32m✓[0m pip3 found
+[0;32m✓[0m Virtual environment exists
+
+[1m[0;34m▶ Step 3: GPU/CUDA Configuration[0m
+[0;32m✓[0m GPU detected: NVIDIA A10
+Testing CUDA/TensorFlow compatibility...
+COMPATIBLE
+[0;32m✓[0m CUDA/TensorFlow compatible - GPU mode enabled
+
+[1m[0;34m▶ Step 4: Installing Dependencies[0m
+Installing Python packages (this may take a few minutes)...
+[0;32m✓[0m All packages installed successfully
+
+[1m[0;34m▶ Step 5: Redis Configuration[0m
+[0;32m✓[0m Redis is running (version 7.0.15)
+
+[1m[0;34m▶ Step 6: Verifying Model Files[0m
+[0;32m✓[0m Detection model found (50M)
+[0;32m✓[0m Extraction model found (167M)
+
+[1m[0;34m▶ Step 7: Creating Helper Scripts[0m
+[0;32m✓[0m Created start_server.sh
+[0;32m✓[0m Created stop_server.sh
+[0;32m✓[0m Created monitor.sh
+
+[1m[0;34m▶ Step 8: Testing System Components[0m
+Testing imports...
+/home/ubuntu/var/www/html/AI_workspace/AI_Agent_Verification/venv/lib/python3.11/site-packages/keras/src/export/tf2onnx_lib.py:8: FutureWarning: In the future `np.object` will be defined as the corresponding NumPy scalar.
+  if not hasattr(np, "object"):
+✓ TensorFlow OK
+✓ PyTorch OK
+✓ OpenCV OK
+✓ DeepFace OK
+✓ YOLO OK
+[0;32m✓[0m All components working
+
+[1m[0;34m▶ Step 9: Final Configuration[0m
+[0;32m✓[0m Created required directories
+[0;32m✓[0m Set directory permissions
+
+[1m[0;32m
+╔════════════════════════════════════════════════════════╗
+║             Setup Complete!                            ║
+╚════════════════════════════════════════════════════════╝
+[0m
+[1mSystem Configuration:[0m
+  GPU Mode: ✓ Enabled
+  Redis: ✓ Running
+  Models: ✓ Found
+
+[1mQuick Commands:[0m
+  Start server:   \033[0;32m./start_server.sh\033[0m
+  Stop server:    \033[0;32m./stop_server.sh\033[0m
+  Monitor logs:   \033[0;32m./monitor.sh\033[0m
+  Check health:   \033[0;32mcurl http://localhost:8101/health\033[0m
+
+[1mNext Steps:[0m
+  1. Start the server: \033[0;32m./start_server.sh\033[0m
+  2. Check health: \033[0;32mcurl http://localhost:8101/health\033[0m
+  3. Monitor logs: \033[0;32mtail -f server.log\033[0m
+
+[1mSetup log saved to:[0m setup_20260108_071742.log
+

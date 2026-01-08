@@ -5,8 +5,8 @@ from deepface import DeepFace
 class FaceAgent:
     def __init__(
         self,
-        model_name: str = "ArcFace",
-        detector_backend: str = "retinaface"
+        model_name: str = "Facenet512",
+        detector_backend: str = "mtcnn"
     ):
         """
         model_name options:

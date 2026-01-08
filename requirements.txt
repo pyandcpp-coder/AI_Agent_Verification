@@ -1,25 +1,41 @@
-opencv-python
-numpy
-torch
-torchvision
-torchaudio
-insightface
-onnxruntime
+# Core numeric / vision
+numpy==1.26.4
+opencv-python==4.8.1.78
+Pillow==10.2.0
+pytesseract==0.3.10
+
+# PyTorch stack (CUDA wheels handled separately)
+torch==2.1.2
+torchvision==0.16.2
+torchaudio==2.1.2
+
+# Face / vision / inference
+insightface==0.7.3
+onnxruntime==1.16.3
 ultralytics
-Pillow
-pytesseract
-fastapi
-uvicorn
-aiohttp
-aiofiles
-pandas
-pydantic
-python-dotenv
-requests
-transformers
-accelerate
+# Backend / API
+fastapi==0.109.0
+uvicorn==0.27.0
+aiohttp==3.9.3
+aiofiles==23.2.1
+
+# Data / config
+pandas==2.1.4
+pydantic==2.5.3
+python-dotenv==1.0.0
+requests==2.32.5
+
+# LLM / transformers
+accelerate==0.25.0
+
+# Infra / misc
+redis==5.0.1
+cloudscraper==1.2.71
+brotlipy==0.7.0
+gspread==5.12.4
+
+# TensorFlow (locked)
+tensorflow==2.15.0
+transformers>=4.37.0
 qwen-vl-utils
-brotlipy
-cloudscraper
-gspread
-redis
+accelerate

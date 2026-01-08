@@ -1,3 +1,5 @@
+server.log
+setup_20260108_071742.log.env
 .env
 venv/
 __pycache__/
@@ -37,3 +39,10 @@ REDIS_WORKFLOW_DIAGRAM.md
 API_RESPONSE_STORAGE.md
 REDIS_MONITORING_GUIDE.md
 test_masked_aadhaar.py
+.ipynb_checkpoints/
+=4.37.0
+KYC Verification Logs - Sheet1.csv
+Untitled.ipynb
+aadhaar_records.pkl
+app/.ipynb_checkpoints/
+app/backup/.ipynb_checkpoints/

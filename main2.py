@@ -13,56 +13,6 @@ from pathlib import Path
 from typing import Optional, Union
 from contextlib import asynccontextmanager
 
-# === CRITICAL FIX: Check GPU BEFORE setting environment ===
-USE_GPU = True
-GPU_AVAILABLE = False
-
-# Check if GPU exists before doing anything
-try:
-    import subprocess
-    result = subprocess.run(['nvidia-smi'], capture_output=True, text=True, timeout=5)
-    if result.returncode == 0:
-        GPU_AVAILABLE = True
-        print("✅ NVIDIA GPU detected")
-except:
-    GPU_AVAILABLE = False
-    print("ℹ️ No NVIDIA GPU detected")
-
-# Only force CPU if explicitly needed or if no GPU
-if not GPU_AVAILABLE:
-    os.environ['CUDA_VISIBLE_DEVICES'] = ''
-    print("ℹ️ Using CPU mode (no GPU available)")
-else:
-    # Let GPU be visible
-    print("ℹ️ GPU mode enabled - initializing with GPU support")
-
-# Now import TensorFlow AFTER setting the environment
-try:
-    import tensorflow as tf
-    
-    if GPU_AVAILABLE:
-        # Configure GPU memory growth
-        gpus = tf.config.list_physical_devices('GPU')
-        if gpus:
-            try:
-                for gpu in gpus:
-                    tf.config.experimental.set_memory_growth(gpu, True)
-                USE_GPU = True
-                print(f"✅ TensorFlow GPU enabled: {len(gpus)} GPU(s) available")
-            except Exception as e:
-                print(f"⚠️ GPU memory growth setup failed: {e}")
-                USE_GPU = False
-        else:
-            print("⚠️ TensorFlow cannot see GPU, falling back to CPU")
-            USE_GPU = False
-    else:
-        print("ℹ️ TensorFlow using CPU mode")
-        USE_GPU = False
-        
-except Exception as e:
-    print(f"⚠️ TensorFlow import/setup failed: {e}")
-    USE_GPU = False
-
 # Ensure the current directory is in the Python path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
@@ -71,9 +21,12 @@ if current_dir not in sys.path:
 # --- IMPORT AGENTS ---
 try:
     from app.face_sim import FaceAgent
+    # DocAgent is no longer needed because EntityAgent now handles card detection & extraction internally
+    # from app.fb_detect import DocAgent 
     from app.entity import EntityAgent
     from app.gender_pipeline import GenderPipeline
     from scoring import VerificationScorer
+    # --- ADDED: Import Redis Cache ---
     from redis_cache import get_cache 
 except ImportError as e:
     print(f"ImportError: {e}")
@@ -102,7 +55,6 @@ async def lifespan(app: FastAPI):
     # Startup
     TEMP_DIR.mkdir(exist_ok=True)
     print("--- STARTING SYSTEM INITIALIZATION ---")
-    print(f"GPU Mode: {USE_GPU}")
     
     # Create persistent HTTP session with stricter connection limits
     connector = aiohttp.TCPConnector(
@@ -116,45 +68,27 @@ async def lifespan(app: FastAPI):
     http_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
     active_sessions.add(http_session)
     
-    # === Error-resistant agent initialization ===
-    try:
-        print("Initializing FaceAgent...")
-        face_agent = FaceAgent()
-        print("✅ FaceAgent initialized")
-    except Exception as e:
-        print(f"⚠️ FaceAgent initialization failed: {e}")
-        face_agent = None
+    # Initialize Agents
+    face_agent = FaceAgent()
     
-    try:
-        print("Initializing EntityAgent...")
-        entity_agent = EntityAgent(
-            model1_path="models/best4.pt", 
-            model2_path="models/best.pt",
-            enable_qwen_fallback=True
-        )
-        print("✅ EntityAgent initialized")
-    except Exception as e:
-        print(f"⚠️ EntityAgent initialization failed: {e}")
-        entity_agent = None
+    # Initialize EntityAgent with both models (Detection + Extraction)
+    # This matches the new flow where EntityAgent does everything including Qwen fallback
+    entity_agent = EntityAgent(
+        model1_path="models/best4.pt", 
+        model2_path="models/best.pt",
+        enable_qwen_fallback=True
+    )
     
-    try:
-        print("Initializing GenderPipeline...")
-        gender_pipeline = GenderPipeline()
-        print("✅ GenderPipeline initialized")
-    except Exception as e:
-        print(f"⚠️ GenderPipeline initialization failed: {e}")
-        gender_pipeline = None
-    
+    gender_pipeline = GenderPipeline()
     scorer = VerificationScorer()
     
-    # Initialize Redis
+    # --- ADDED: Initialize Redis ---
     try:
         redis_cache = get_cache()
         if redis_cache.enabled:
-            print(f"✅ Redis Cache Initialized")
+            print(f"✅ Redis Cache Initialized via lifespan")
     except Exception as e:
         print(f"⚠️ Redis Init Warning: {e}")
-        redis_cache = None
 
     # Start background cleanup task
     cleanup_task = asyncio.create_task(periodic_cleanup())
@@ -172,11 +106,12 @@ async def lifespan(app: FastAPI):
     
     if http_session:
         await http_session.close()
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(0.25)  # Give time for connections to close
     
     if redis_cache and redis_cache.enabled:
         redis_cache.close()
 
+    # Final cleanup of temp directory
     if TEMP_DIR.exists():
         try:
             shutil.rmtree(TEMP_DIR, ignore_errors=True)
@@ -192,7 +127,7 @@ async def periodic_cleanup():
     import time
     while True:
         try:
-            await asyncio.sleep(120)
+            await asyncio.sleep(120)  # Run every 2 minutes
             
             if not TEMP_DIR.exists():
                 continue
@@ -200,6 +135,7 @@ async def periodic_cleanup():
             current_time = time.time()
             cleaned_count = 0
             
+            # Delete directories older than 5 minutes
             for user_dir in TEMP_DIR.iterdir():
                 if not user_dir.is_dir():
                     continue
@@ -214,7 +150,7 @@ async def periodic_cleanup():
             
             if cleaned_count > 0:
                 print(f"Periodic cleanup: Removed {cleaned_count} old temp directories")
-                gc.collect()
+                gc.collect()  # Force garbage collection after cleanup
                 
         except Exception as e:
             print(f"Error in periodic cleanup: {e}")
@@ -223,17 +159,21 @@ def force_cleanup_directory(directory: Path, max_retries: int = 3):
     """Aggressively cleanup a directory with retries."""
     for attempt in range(max_retries):
         try:
+            # Force garbage collection to close file handles
             gc.collect()
             
+            # First try: normal removal
             if attempt == 0:
                 shutil.rmtree(directory, ignore_errors=False)
                 return
             
+            # Second try: ignore errors
             if attempt == 1:
                 shutil.rmtree(directory, ignore_errors=True)
                 if not directory.exists():
                     return
             
+            # Final try: manual file-by-file deletion
             if directory.exists():
                 for item in directory.rglob('*'):
                     try:
@@ -259,8 +199,9 @@ def force_cleanup_directory(directory: Path, max_retries: int = 3):
                 print(f"Failed to cleanup {directory} after {max_retries} attempts: {e}")
             else:
                 import time
-                time.sleep(0.1 * (attempt + 1))
+                time.sleep(0.1 * (attempt + 1))  # Progressive backoff
 
+# --- INPUT MODEL ---
 class VerifyRequest(BaseModel):
     user_id: Union[int, str]
     dob: Optional[str] = None
@@ -270,7 +211,9 @@ class VerifyRequest(BaseModel):
     gender: Optional[str] = None
 
 async def fetch_file(session: aiohttp.ClientSession, source: str, destination: Path) -> bool:
-    """Hybrid Fetcher with proper resource management."""
+    """
+    Hybrid Fetcher with proper resource management.
+    """
     try:
         if str(source).startswith(('http://', 'https://')):
             loop = asyncio.get_event_loop()
@@ -341,142 +284,79 @@ async def setup_files(user_id: str, req: VerifyRequest):
 
 @app.post("/verification/verify")
 async def verify_user(req: VerifyRequest):
-    """Full verification endpoint with enhanced error handling."""
+    """Full verification endpoint with detailed breakdown."""
     user_id = str(req.user_id)
     print(f"[{user_id}] New Verification Request")
 
-    # Check agent availability
-    if not all([face_agent, entity_agent, gender_pipeline, scorer]):
-        return {
-            "user_id": user_id,
-            "status": "ERROR",
-            "final_decision": "SYSTEM_ERROR",
-            "status_code": -1,
-            "score": 0,
-            "reason": "System components not initialized properly",
-            "rejection_reasons": ["system_initialization_failed"]
-        }
-
-    # Check Redis Cache First
+    # --- ADDED: Check Redis Cache First ---
     if redis_cache and redis_cache.enabled:
-        try:
-            cached_data = redis_cache.get_verification_result(user_id)
-            if cached_data:
-                print(f"[{user_id}] ✅ Returning Cached Result")
-                return cached_data.get('verification_result', cached_data)
-        except Exception as e:
-            print(f"[{user_id}] Redis cache read failed: {e}")
+        cached_data = redis_cache.get_verification_result(user_id)
+        if cached_data:
+            print(f"[{user_id}] ✅ Returning Cached Result")
+            # Return the stored 'verification_result' portion
+            return cached_data.get('verification_result')
 
     files, task_dir = await setup_files(user_id, req)
     if not files:
         return {
             "user_id": user_id,
-            "status": "FAILED",
-            "final_decision": "REJECTED",
-            "status_code": 1,
-            "score": 0,
-            "reason": "File Retrieval Failed",
-            "rejection_reasons": ["file_download_failed"]
+            "status": "FAILED", 
+            "reason": "File Retrieval Failed"
         }
 
     try:
         loop = asyncio.get_event_loop()
         
-        # Face Comparison with error handling
-        async def safe_face_compare():
-            try:
-                return await loop.run_in_executor(None, face_agent.compare, files['selfie'], files['front'])
-            except Exception as e:
-                print(f"[{user_id}] Face comparison failed: {e}")
-                return {
-                    'face_detected': False,
-                    'similarity': 0.0,
-                    'error': str(e)
-                }
+        # 1. Face Comparison
+        face_task = loop.run_in_executor(None, face_agent.compare, files['selfie'], files['front'])
 
-        # Entity Pipeline with error handling
-        async def safe_entity_process():
-            try:
-                entity_task_args = [files['front'], files['back']]
-                return await loop.run_in_executor(
-                    None, 
-                    entity_agent.process_images, 
-                    entity_task_args, 
-                    user_id, 
-                    "main_process", 
-                    0.15
-                )
-            except Exception as e:
-                print(f"[{user_id}] Entity processing failed: {e}")
-                return {
-                    'success': False,
-                    'error': f'entity_processing_failed: {str(e)}',
-                    'data': {}
-                }
+        # 2. Entity Pipeline (Detection + Extraction)
+        # We use EntityAgent.process_images which now handles everything including Qwen fallback
+        # Arguments: image_paths_list, user_id, task_id, threshold
+        entity_task_args = [files['front'], files['back']]
+        
+        async def run_entity_pipeline():
+            entity_res = await loop.run_in_executor(
+                None, 
+                entity_agent.process_images, 
+                entity_task_args, 
+                user_id, 
+                "main_process", 
+                0.15 # Confidence threshold
+            )
+            return entity_res
 
-        # Gender Detection with error handling
-        async def safe_gender_detect():
-            try:
-                return await loop.run_in_executor(None, gender_pipeline.detect_gender, files['front'])
-            except Exception as e:
-                print(f"[{user_id}] Gender detection failed: {e}")
-                return type('obj', (object,), {
-                    'face_detected': False,
-                    'gender': 'Unknown',
-                    'confidence': 0.0
-                })()
+        # 3. Gender Fallback
+        gender_task = loop.run_in_executor(None, gender_pipeline.detect_gender, files['front'])
 
         # Execute all tasks in parallel
-        face_score, entity_res, gender_res = await asyncio.gather(
-            safe_face_compare(), 
-            safe_entity_process(), 
-            safe_gender_detect()
-        )
+        face_score, entity_res, gender_res = await asyncio.gather(face_task, run_entity_pipeline(), gender_task)
 
-        # Check if entity processing failed critically
+        # --- VALIDATE ENTITY RESULT (Front/Back Detection Check) ---
         if not entity_res.get('success'):
+            # This handles cases where no cards were found
             error_msg = entity_res.get('error', 'Document Verification Failed')
-            
-            if 'no_aadhar_detected' in error_msg.lower():
+            if error_msg == 'no_aadhar_detected':
                 reason = "Aadhaar Card Not Detected (Front/Back Missing)"
-            elif 'security' in error_msg.lower():
-                reason = "Security Check Failed - Suspicious Document Detected"
-            elif 'processing_failed' in error_msg.lower():
-                reason = "Document Processing Failed - Poor Image Quality"
             else:
-                reason = f"Verification Error: {error_msg}"
+                reason = f"Processing Error: {error_msg}"
                 
             response = {
                 "user_id": user_id,
                 "status": "REJECTED",
-                "final_decision": "REJECTED",
-                "status_code": 1,
                 "score": 0,
-                "reason": reason,
-                "rejection_reasons": [error_msg],
-                "extracted_data": {},
-                "input_data": {
-                    "dob": req.dob,
-                    "gender": req.gender
-                }
+                "reason": reason
             }
-            
-            if redis_cache and redis_cache.enabled:
-                try:
-                    redis_cache.store_verification_result(user_id, response)
-                except Exception as e:
-                    print(f"[{user_id}] Failed to cache result: {e}")
-            
             return response
 
         # Retrieve extracted data
         merged_data = entity_res.get('data', {})
         
-        # Gender Logic
+        # --- Gender Logic (Merging OCR + Pipeline) ---
         ocr_gender = merged_data.get('gender', 'Other')
         
-        if ocr_gender in ['Other', 'Not Detected', None] and hasattr(gender_res, 'face_detected') and gender_res.face_detected:
-            detected_gender = gender_res.gender.capitalize() if hasattr(gender_res, 'gender') else 'Unknown'
+        if ocr_gender in ['Other', 'Not Detected', None] and gender_res.face_detected:
+            detected_gender = gender_res.gender.capitalize()
             if detected_gender in ['Male', 'Female']:
                 print(f"[{user_id}] OCR Gender '{ocr_gender}' -> Fallback: {detected_gender}")
                 merged_data['gender'] = detected_gender
@@ -486,7 +366,7 @@ async def verify_user(req: VerifyRequest):
         else:
             merged_data['gender_source'] = 'ocr'
 
-        # Scoring
+        # --- Scoring ---
         expected_gender = req.gender.lower() if req.gender else None
         expected_dob = req.dob if req.dob else None
         
@@ -515,68 +395,41 @@ async def verify_user(req: VerifyRequest):
                 "dob": req.dob,
                 "gender": req.gender
             },
-            "rejection_reasons": final_result.get('rejection_reasons', [])
+            "rejection_reasons": final_result['rejection_reasons']
         }
 
-        # Store in Redis
+        # --- ADDED: Store in Redis ---
         if redis_cache and redis_cache.enabled:
-            try:
-                redis_cache.store_verification_result(user_id, final_response)
-                print(f"[{user_id}] 💾 Result Cached")
-            except Exception as e:
-                print(f"[{user_id}] Failed to cache result: {e}")
+            # We store the final_response directly
+            redis_cache.store_verification_result(user_id, final_response)
+            print(f"[{user_id}] 💾 Result Cached")
 
         return final_response
 
     except Exception as e:
         import traceback
-        error_trace = traceback.format_exc()
-        print(f"[{user_id}] CRITICAL ERROR:")
-        print(error_trace)
-        
+        traceback.print_exc()
         return {
             "user_id": user_id,
-            "status": "ERROR",
-            "final_decision": "SYSTEM_ERROR",
-            "status_code": -1,
-            "score": 0,
-            "message": str(e),
-            "reason": "Internal Processing Error",
-            "rejection_reasons": ["system_error"],
-            "extracted_data": {},
-            "input_data": {
-                "dob": req.dob,
-                "gender": req.gender
-            }
+            "status": "ERROR", 
+            "message": str(e)
         }
 
     finally:
+        # Immediate cleanup
         if task_dir and task_dir.exists():
             force_cleanup_directory(task_dir)
             print(f"[{user_id}] Cleanup Complete")
         
+        # Force garbage collection
         gc.collect()
 
 @app.post("/verification/verify/agent/")
 async def verify_user_production(req: VerifyRequest):
     """Production endpoint - reuse logic from verify_user."""
+    # Since the logic is identical and we want consistent caching, we just call verify_user
     return await verify_user(req)
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint to verify system status."""
-    return {
-        "status": "healthy",
-        "gpu_enabled": USE_GPU,
-        "components": {
-            "face_agent": face_agent is not None,
-            "entity_agent": entity_agent is not None,
-            "gender_pipeline": gender_pipeline is not None,
-            "scorer": scorer is not None,
-            "redis": redis_cache is not None and redis_cache.enabled if redis_cache else False
-        }
-    }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8101, workers=1)
+    uvicorn.run(app, host="0.0.0.0", port=8101, workers=1) 
