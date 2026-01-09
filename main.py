@@ -7,11 +7,27 @@ import aiofiles
 import cloudscraper
 import gc
 import weakref
+import time
+import traceback
 from fastapi import FastAPI
 from pydantic import BaseModel
 from pathlib import Path
 from typing import Optional, Union
 from contextlib import asynccontextmanager
+
+# Set PyTorch memory management environment variable to reduce fragmentation
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
+# Production imports
+try:
+    from logging_config import setup_production_logging, get_verification_logger
+    from monitoring import get_monitor
+    PRODUCTION_MODE = True
+except ImportError:
+    # Fallback if production modules not available
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    PRODUCTION_MODE = False
 
 # === CRITICAL FIX: Check GPU BEFORE setting environment ===
 USE_GPU = True
@@ -26,15 +42,15 @@ try:
         print("✅ NVIDIA GPU detected")
 except:
     GPU_AVAILABLE = False
-    print("ℹ️ No NVIDIA GPU detected")
+    print("No NVIDIA GPU detected")
 
 # Only force CPU if explicitly needed or if no GPU
 if not GPU_AVAILABLE:
     os.environ['CUDA_VISIBLE_DEVICES'] = ''
-    print("ℹ️ Using CPU mode (no GPU available)")
+    print("Using CPU mode (no GPU available)")
 else:
     # Let GPU be visible
-    print("ℹ️ GPU mode enabled - initializing with GPU support")
+    print("GPU mode enabled - initializing with GPU support")
 
 # Now import TensorFlow AFTER setting the environment
 try:
@@ -63,6 +79,17 @@ except Exception as e:
     print(f"⚠️ TensorFlow import/setup failed: {e}")
     USE_GPU = False
 
+# Setup production logging if available
+if PRODUCTION_MODE:
+    log_level = os.getenv("LOG_LEVEL", "INFO")
+    setup_production_logging(log_level=log_level, log_dir="logs")
+    verification_logger = get_verification_logger()
+    monitor = get_monitor()
+    print("✅ Production logging and monitoring enabled")
+else:
+    verification_logger = None
+    monitor = None
+
 # Ensure the current directory is in the Python path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
@@ -73,6 +100,7 @@ try:
     from app.face_sim import FaceAgent
     from app.entity import EntityAgent
     from app.gender_pipeline import GenderPipeline
+    from app.qwen_fallback import QwenFallbackAgent
     from scoring import VerificationScorer
     from redis_cache import get_cache 
 except ImportError as e:
@@ -85,6 +113,7 @@ except ImportError as e:
 face_agent = None
 entity_agent = None
 gender_pipeline = None
+qwen_agent = None
 scorer = None
 http_session = None
 redis_cache = None
@@ -97,7 +126,7 @@ active_sessions = weakref.WeakSet()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
-    global face_agent, entity_agent, gender_pipeline, scorer, http_session, redis_cache
+    global face_agent, entity_agent, gender_pipeline, qwen_agent, scorer, http_session, redis_cache
     
     # Startup
     TEMP_DIR.mkdir(exist_ok=True)
@@ -144,6 +173,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"⚠️ GenderPipeline initialization failed: {e}")
         gender_pipeline = None
+    
+    try:
+        print("Initializing QwenFallbackAgent...")
+        qwen_agent = QwenFallbackAgent()
+        print("✅ QwenFallbackAgent initialized")
+    except Exception as e:
+        print(f"⚠️ QwenFallbackAgent initialization failed: {e}")
+        qwen_agent = None
     
     scorer = VerificationScorer()
     
@@ -343,6 +380,12 @@ async def setup_files(user_id: str, req: VerifyRequest):
 async def verify_user(req: VerifyRequest):
     """Full verification endpoint with enhanced error handling."""
     user_id = str(req.user_id)
+    start_time = time.time()
+    
+    # Log request if production mode
+    if PRODUCTION_MODE and verification_logger:
+        verification_logger.log_request(user_id, bool(req.dob), bool(req.gender))
+    
     print(f"[{user_id}] New Verification Request")
 
     # Check agent availability
@@ -363,9 +406,18 @@ async def verify_user(req: VerifyRequest):
             cached_data = redis_cache.get_verification_result(user_id)
             if cached_data:
                 print(f"[{user_id}] ✅ Returning Cached Result")
+                if PRODUCTION_MODE and verification_logger:
+                    verification_logger.log_cache_hit(user_id)
+                if PRODUCTION_MODE and monitor:
+                    monitor.record_cache_hit()
                 return cached_data.get('verification_result', cached_data)
+            else:
+                if PRODUCTION_MODE and monitor:
+                    monitor.record_cache_miss()
         except Exception as e:
             print(f"[{user_id}] Redis cache read failed: {e}")
+            if PRODUCTION_MODE and monitor:
+                monitor.record_cache_miss()
 
     files, task_dir = await setup_files(user_id, req)
     if not files:
@@ -472,6 +524,26 @@ async def verify_user(req: VerifyRequest):
         # Retrieve extracted data
         merged_data = entity_res.get('data', {})
         
+        # === QWEN FACE VERIFICATION FALLBACK ===
+        # Trigger when face similarity is very low (<20%)
+        face_sim_score = face_score.get("score", 0)
+        qwen_face_result = None
+        
+        if face_sim_score < 20 and qwen_agent:
+            print(f"[{user_id}] ⚠️ Face similarity very low ({face_sim_score:.2f}%) - Triggering Qwen Face Verification")
+            try:
+                qwen_face_result = await loop.run_in_executor(
+                    None,
+                    qwen_agent.verify_face_with_qwen,
+                    files['selfie'],
+                    files['front'],
+                    req.gender
+                )
+                print(f"[{user_id}] 🤖 Qwen Face Verification: {qwen_face_result.get('decision')} - {qwen_face_result.get('reason')}")
+            except Exception as e:
+                print(f"[{user_id}] Qwen face verification failed: {e}")
+                qwen_face_result = None
+        
         # Gender Logic
         ocr_gender = merged_data.get('gender', 'Other')
         
@@ -494,7 +566,8 @@ async def verify_user(req: VerifyRequest):
             face_data=face_score,
             entity_data=merged_data,
             expected_gender=expected_gender,
-            expected_dob=expected_dob
+            expected_dob=expected_dob,
+            qwen_face_result=qwen_face_result
         )
 
         status_code_map = {"APPROVED": 2, "REJECTED": 1, "REVIEW": 0}
@@ -517,6 +590,22 @@ async def verify_user(req: VerifyRequest):
             },
             "rejection_reasons": final_result.get('rejection_reasons', [])
         }
+        
+        # Record metrics
+        if PRODUCTION_MODE and monitor:
+            processing_time = time.time() - start_time
+            monitor.record_verification(final_result['status'], processing_time)
+        
+        # Log result
+        if PRODUCTION_MODE and verification_logger:
+            processing_time = time.time() - start_time
+            verification_logger.log_result(
+                user_id, 
+                final_result['status'], 
+                final_result['total_score'],
+                final_result['breakdown'].get('face_score', 0),
+                processing_time
+            )
 
         # Store in Redis
         if redis_cache and redis_cache.enabled:
@@ -529,10 +618,16 @@ async def verify_user(req: VerifyRequest):
         return final_response
 
     except Exception as e:
-        import traceback
         error_trace = traceback.format_exc()
         print(f"[{user_id}] CRITICAL ERROR:")
         print(error_trace)
+        
+        # Record error
+        if PRODUCTION_MODE and monitor:
+            monitor.record_error("system_error")
+        
+        if PRODUCTION_MODE and verification_logger:
+            verification_logger.log_error(user_id, "system_error", str(e))
         
         return {
             "user_id": user_id,
@@ -565,7 +660,7 @@ async def verify_user_production(req: VerifyRequest):
 @app.get("/health")
 async def health_check():
     """Health check endpoint to verify system status."""
-    return {
+    base_health = {
         "status": "healthy",
         "gpu_enabled": USE_GPU,
         "components": {
@@ -576,6 +671,25 @@ async def health_check():
             "redis": redis_cache is not None and redis_cache.enabled if redis_cache else False
         }
     }
+    
+    # Add monitoring data if available
+    if PRODUCTION_MODE and monitor:
+        base_health["monitoring"] = monitor.get_health_status()
+    
+    return base_health
+
+
+@app.get("/metrics")
+async def get_metrics():
+    """Get application metrics (production only)."""
+    if not PRODUCTION_MODE or not monitor:
+        return {"error": "Metrics not available (production mode disabled)"}
+    
+    return {
+        "system": monitor.get_system_stats(),
+        "application": monitor.get_application_metrics()
+    }
+    
 
 if __name__ == "__main__":
     import uvicorn

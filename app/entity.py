@@ -22,6 +22,12 @@ from app.qwen_fallback import QwenFallbackAgent
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def clear_gpu_memory():
+    """Clear GPU memory to prevent OOM errors."""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
 class EntityAgent:
     def __init__(self, model1_path="models/best4.pt", model2_path="models/best.pt", other_lang_code='hin+tel+ben', enable_qwen_fallback=True, aadhaar_db_path="aadhaar_records.pkl"):
         if torch.cuda.is_available():
@@ -56,6 +62,10 @@ class EntityAgent:
         try:
             self.model1 = YOLO(self.model1_path)
             self.model2 = YOLO(self.model2_path)
+            
+            # Clear cache after loading models
+            clear_gpu_memory()
+            logger.info("GPU memory cleared after model loading")
         except Exception as e:
             logger.error(f"Failed to load YOLO models: {e}")
             # Do not raise here to allow main.py to handle initialization errors if needed
@@ -201,6 +211,10 @@ class EntityAgent:
         cropped_cards = {'front': [], 'back': []}
         for image_path in image_paths:
             logger.info(f"  Processing: {Path(image_path).name}")
+            
+            # Clear cache before processing each image
+            clear_gpu_memory()
+            
             results = self.model1(str(image_path), device=self.device, verbose=False)
             img = cv2.imread(str(image_path))
             input_filename = Path(image_path).stem
@@ -238,6 +252,9 @@ class EntityAgent:
             card_type = card_info['type']
             logger.info(f"  Processing: {card_name}")
             
+            # Clear cache before inference to free memory
+            clear_gpu_memory()
+            
             results = self.model2(img, device=self.device, verbose=False)
             card_detections = []
             
@@ -248,6 +265,9 @@ class EntityAgent:
                 card_detections.append({'bbox': (x1, y1, x2, y2), 'class_name': class_name, 'confidence': float(box.conf[0])})
                 
             logger.info(f"  Detected {len(card_detections)} entities in {card_name}")
+            
+            # Clear cache after each card to free memory
+            clear_gpu_memory()
             all_detections[card_name] = {
                 "card_image": img,
                 "card_type": card_type,

@@ -42,13 +42,18 @@ class QwenFallbackAgent:
             self.model = Qwen2VLForConditionalGeneration.from_pretrained(
                 model_name,
                 torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-                device_map="auto" if self.device == "cuda" else None
+                device_map="auto" if self.device == "cuda" else None,
+                low_cpu_mem_usage=True  # Reduce memory usage during loading
             )
             
             self.processor = AutoProcessor.from_pretrained(model_name)
             
             if self.device == "cpu":
                 self.model = self.model.to(self.device)
+            
+            # Clear cache after loading model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
             logger.info("✅ Qwen3-VL model loaded successfully")
             
@@ -177,6 +182,11 @@ class QwenFallbackAgent:
             )
             inputs = inputs.to(self.device)
             
+            # Clear GPU cache before inference
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            
             # Generate response
             logger.info("🔄 Generating extraction...")
             with torch.no_grad():
@@ -198,6 +208,11 @@ class QwenFallbackAgent:
             )[0]
             
             logger.info(f"📤 Raw model output: {output_text}")
+            
+            # Clear GPU cache after inference
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
             
             # Parse the output
             extracted_data = self._parse_model_output(output_text, missing_fields)
@@ -393,3 +408,237 @@ class QwenFallbackAgent:
                     logger.info(f"❌ Age rejected: {qwen_data['age']} years")
         
         return merged
+    
+    def verify_face_with_qwen(self, selfie_image_path: str, aadhaar_front_path: str, 
+                              expected_gender: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Use Qwen VLM for face verification when standard face similarity fails.
+        Checks both gender match and face similarity between selfie and Aadhaar.
+        
+        Args:
+            selfie_image_path: Path to selfie/face verification image
+            aadhaar_front_path: Path to Aadhaar front image
+            expected_gender: Expected gender (optional)
+        
+        Returns:
+            Dict containing:
+                - face_match: bool (whether faces match)
+                - gender_match: bool (whether genders match)
+                - gender_detected: str (Male/Female/Unknown)
+                - confidence: str (Low/Medium/High)
+                - decision: str (APPROVED/REJECTED)
+                - reason: str (explanation)
+        """
+        logger.info("\n" + "=" * 60)
+        logger.info("🔍 Qwen Face Verification Fallback Triggered")
+        logger.info("=" * 60)
+        logger.info("⚠️ Standard face similarity is very low - Using VLM verification")
+        
+        try:
+            # Prepare images
+            selfie_img = self._prepare_image(selfie_image_path)
+            aadhaar_img = self._prepare_image(aadhaar_front_path)
+            
+            # Build comprehensive prompt for face + gender verification
+            prompt = self._build_face_verification_prompt(expected_gender)
+            
+            logger.info(f"📝 Verification Prompt: {prompt[:200]}...")
+            
+            # Prepare messages with both images
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Image 1 (Selfie Photo):"},
+                        {"type": "image", "image": selfie_img},
+                        {"type": "text", "text": "Image 2 (Aadhaar Card Front):"},
+                        {"type": "image", "image": aadhaar_img},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ]
+            
+            # Apply chat template
+            text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            
+            # Process vision info
+            image_inputs, video_inputs = process_vision_info(messages)
+            
+            # Prepare inputs
+            inputs = self.processor(
+                text=[text],
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt",
+            )
+            inputs = inputs.to(self.device)
+            
+            # Generate response
+            logger.info("🔄 Analyzing faces with Qwen VLM...")
+            with torch.no_grad():
+                generated_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=512,
+                    temperature=0.2,  # Slightly higher for reasoning
+                    do_sample=True
+                )
+            
+            # Trim and decode
+            generated_ids_trimmed = [
+                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            ]
+            output_text = self.processor.batch_decode(
+                generated_ids_trimmed, 
+                skip_special_tokens=True, 
+                clean_up_tokenization_spaces=False
+            )[0]
+            
+            logger.info(f"📤 Qwen VLM Response:\n{output_text}")
+            
+            # Parse the response
+            verification_result = self._parse_face_verification_output(output_text, expected_gender)
+            
+            logger.info("\n" + "=" * 60)
+            logger.info("✅ Qwen Face Verification Results:")
+            logger.info(f"  Face Match: {verification_result['face_match']}")
+            logger.info(f"  Gender Match: {verification_result['gender_match']}")
+            logger.info(f"  Gender Detected: {verification_result['gender_detected']}")
+            logger.info(f"  Confidence: {verification_result['confidence']}")
+            logger.info(f"  Decision: {verification_result['decision']}")
+            logger.info(f"  Reason: {verification_result['reason']}")
+            logger.info("=" * 60)
+            
+            return verification_result
+            
+        except Exception as e:
+            logger.error(f"❌ Error in Qwen face verification: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {
+                'face_match': False,
+                'gender_match': False,
+                'gender_detected': 'Unknown',
+                'confidence': 'Low',
+                'decision': 'REJECTED',
+                'reason': f'Qwen verification failed: {str(e)}',
+                'error': str(e)
+            }
+    
+    def _build_face_verification_prompt(self, expected_gender: Optional[str] = None) -> str:
+        """
+        Build prompt for face verification analysis.
+        """
+        prompt = """You are an expert in biometric face verification and identity document analysis.
+
+TASK:
+1. Compare the person in Image 1 (Selfie) with the person in Image 2 (Aadhaar Card photo)
+2. Determine if they are the SAME PERSON
+3. Detect the gender from the Aadhaar card
+4. Assess your confidence level
+
+ANALYZE:
+- Facial features: eyes, nose, mouth, face shape, ears
+- Age progression (selfie might be more recent)
+- Gender characteristics
+- Overall facial similarity
+
+IMPORTANT:
+- Photos may have different quality, lighting, or age
+- Focus on permanent facial features
+- Be thorough but fair in assessment
+"""
+        
+        if expected_gender:
+            prompt += f"\n- Expected gender: {expected_gender}\n"
+        
+        prompt += """\nRESPOND IN THIS EXACT FORMAT:
+
+FACE_MATCH: [YES/NO/UNCERTAIN]
+GENDER: [MALE/FEMALE/UNCERTAIN]
+CONFIDENCE: [HIGH/MEDIUM/LOW]
+REASONING: [Explain your analysis in 2-3 sentences]
+
+Be precise and follow the format exactly."""
+        
+        return prompt
+    
+    def _parse_face_verification_output(self, output_text: str, expected_gender: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Parse Qwen VLM output for face verification.
+        """
+        result = {
+            'face_match': False,
+            'gender_match': False,
+            'gender_detected': 'Unknown',
+            'confidence': 'Low',
+            'decision': 'REJECTED',
+            'reason': '',
+            'raw_output': output_text
+        }
+        
+        output_upper = output_text.upper()
+        
+        # Parse FACE_MATCH
+        face_match_pattern = re.search(r'FACE[_\s]*MATCH[:\s]*(YES|NO|UNCERTAIN)', output_upper)
+        if face_match_pattern:
+            face_match_value = face_match_pattern.group(1)
+            result['face_match'] = (face_match_value == 'YES')
+            if face_match_value == 'UNCERTAIN':
+                result['face_uncertain'] = True
+        else:
+            # Fallback: look for keywords
+            if 'SAME PERSON' in output_upper or 'MATCH' in output_upper:
+                result['face_match'] = True
+            elif 'NOT THE SAME' in output_upper or 'DIFFERENT' in output_upper:
+                result['face_match'] = False
+        
+        # Parse GENDER
+        gender_pattern = re.search(r'GENDER[:\s]*(MALE|FEMALE|UNCERTAIN)', output_upper)
+        if gender_pattern:
+            gender_value = gender_pattern.group(1)
+            if gender_value in ['MALE', 'FEMALE']:
+                result['gender_detected'] = gender_value.capitalize()
+        else:
+            # Fallback
+            if 'MALE' in output_upper and 'FEMALE' not in output_upper:
+                result['gender_detected'] = 'Male'
+            elif 'FEMALE' in output_upper:
+                result['gender_detected'] = 'Female'
+        
+        # Check gender match
+        if expected_gender and result['gender_detected'] != 'Unknown':
+            expected_clean = expected_gender.lower()
+            detected_clean = result['gender_detected'].lower()
+            result['gender_match'] = (expected_clean == detected_clean)
+        else:
+            result['gender_match'] = True  # No expected gender or couldn't detect
+        
+        # Parse CONFIDENCE
+        confidence_pattern = re.search(r'CONFIDENCE[:\s]*(HIGH|MEDIUM|LOW)', output_upper)
+        if confidence_pattern:
+            result['confidence'] = confidence_pattern.group(1).capitalize()
+        
+        # Extract reasoning
+        reasoning_pattern = re.search(r'REASONING[:\s]*([^\n]+(?:\n[^\n]+)*)', output_text, re.IGNORECASE)
+        if reasoning_pattern:
+            result['reasoning'] = reasoning_pattern.group(1).strip()
+        
+        # Make decision
+        if result['face_match'] and result['gender_match']:
+            if result['confidence'] in ['High', 'Medium']:
+                result['decision'] = 'APPROVED'
+                result['reason'] = f"Qwen VLM verified face match with {result['confidence']} confidence"
+            else:
+                result['decision'] = 'REVIEW'
+                result['reason'] = f"Face match detected but with low confidence"
+        elif result['face_match'] and not result['gender_match']:
+            result['decision'] = 'REJECTED'
+            result['reason'] = f"Face matches but gender mismatch (Expected: {expected_gender}, Detected: {result['gender_detected']})"
+        else:
+            result['decision'] = 'REJECTED'
+            result['reason'] = f"Face verification failed - Faces do not match sufficiently"
+        
+        return result

@@ -42,26 +42,77 @@ class VerificationScorer:
         
         return None
 
-    def calculate_score(self, face_data, entity_data, expected_gender, expected_dob=None):
+    def calculate_score(self, face_data, entity_data, expected_gender, expected_dob=None, qwen_face_result=None):
         score = 0
         breakdown = {}
         rejection_reasons = []
         critical_failure = False  # If True, status is REJECTED regardless of score
+        qwen_override = False  # Flag to track if Qwen provided override decision
 
         # --- 1. Face Similarity (0 - 20 points) ---
         face_sim = face_data.get("score", 0)
         low_face_sim = False
         
-        if face_sim < 20 :
+        # Check if Qwen face verification was performed and successful
+        if qwen_face_result and face_sim < 20:
+            qwen_decision = qwen_face_result.get('decision', 'REJECTED')
+            qwen_face_match = qwen_face_result.get('face_match', False)
+            qwen_gender_match = qwen_face_result.get('gender_match', False)
+            qwen_confidence = qwen_face_result.get('confidence', 'Low')
+            
+            print(f"🔍 Qwen Face Verification Override Active:")
+            print(f"   Decision: {qwen_decision}")
+            print(f"   Face Match: {qwen_face_match}")
+            print(f"   Gender Match: {qwen_gender_match}")
+            print(f"   Confidence: {qwen_confidence}")
+            
+            if qwen_decision == 'APPROVED':
+                # Qwen approved - override low face similarity
+                # Award points based on confidence
+                if qwen_confidence == 'High':
+                    breakdown["face_score"] = self.weights["face"]  # Full points
+                    score += self.weights["face"]
+                    breakdown["qwen_face_verification"] = "Approved (High Confidence)"
+                elif qwen_confidence == 'Medium':
+                    breakdown["face_score"] = self.weights["face"] * 0.8  # 80% points
+                    score += self.weights["face"] * 0.8
+                    breakdown["qwen_face_verification"] = "Approved (Medium Confidence)"
+                else:
+                    breakdown["face_score"] = self.weights["face"] * 0.5  # 50% points
+                    score += self.weights["face"] * 0.5
+                    breakdown["qwen_face_verification"] = "Approved (Low Confidence)"
+                qwen_override = True
+                low_face_sim = False
+                
+                # Update gender from Qwen if detected
+                if qwen_gender_match and qwen_face_result.get('gender_detected') != 'Unknown':
+                    entity_data['gender'] = qwen_face_result.get('gender_detected')
+                    entity_data['gender_source'] = 'qwen_vlm'
+                    
+            elif qwen_decision == 'REVIEW':
+                # Qwen uncertain - give partial points
+                breakdown["face_score"] = self.weights["face"] * 0.4  # 40% points
+                score += self.weights["face"] * 0.4
+                breakdown["qwen_face_verification"] = "Manual Review Required"
+                low_face_sim = True
+            else:
+                # Qwen rejected - enforce rejection
+                breakdown["face_score"] = 0
+                low_face_sim = True
+                critical_failure = True
+                rejection_reasons.append(f"Qwen VLM Face Verification Failed: {qwen_face_result.get('reason', 'Unknown')}")
+                breakdown["qwen_face_verification"] = "Rejected"
+        
+        elif face_sim < 20:
             # Very low face similarity - Give 0 points and flag for review
             breakdown["face_score"] = 0
             low_face_sim = True
             critical_failure = True
             rejection_reasons.append(f"Low Face Similarity (Similarity: {face_sim:.2f}%)")
         else:
-            # Between 5% and 100% -> Scale linearly to 0-20 points
-            # Formula: ((Score - 5) / 95) * 20, where 95 is the range (100-5)
-            face_points = ((face_sim - 5) / 95) * self.weights["face"]
+            # Between 20% and 100% -> Scale linearly to 0-15 points
+            # Formula: ((Score - 20) / 80) * 15, where 80 is the range (100-20)
+            face_points = ((face_sim - 20) / 80) * self.weights["face"]
             score += face_points
             breakdown["face_score"] = round(face_points, 2)
 

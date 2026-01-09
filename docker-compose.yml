@@ -1,0 +1,112 @@
+services:
+  # Redis Cache Service
+  redis:
+    image: redis:7-alpine
+    platform: linux/amd64
+    container_name: kyc_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - kyc_network
+
+  # Main Verification Application
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kyc_verification_app
+    restart: unless-stopped
+    # Uncomment below to enable GPU support (requires nvidia-container-toolkit)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    ports:
+      - "8101:8101"
+    environment:
+      # Redis Configuration
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_TTL_HOURS=24
+      
+      # Application Configuration
+      - LOG_LEVEL=INFO
+      - WORKERS=1
+      - MAX_FILE_SIZE=10485760
+      - TEMP_DIR=/app/temp
+      - ENABLE_QWEN_FALLBACK=true
+      
+      # Model Paths
+      - MODEL1_PATH=/app/models/best4.pt
+      - MODEL2_PATH=/app/models/best.pt
+      
+      # Ollama Configuration (runs on host)
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://host.docker.internal:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5:7b}
+      
+      # Python Configuration
+      - PYTHONUNBUFFERED=1
+      - CUDA_VISIBLE_DEVICES=0
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Model files (mount your models directory)
+      - ./models:/app/models:ro
+      # Temporary files (ephemeral storage)
+      - app_temp:/app/temp
+      # Logs (persistent for debugging)
+      - ./logs:/app/logs
+      # Aadhaar database (persistent)
+      - app_data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    # healthcheck:
+    #   test: ["CMD", "curl", "-f", "http://localhost:8101/health"]
+    #   interval: 30s
+    #   timeout: 10s
+    #   retries: 3
+    #   start_period: 180s  # Give 3 minutes for model loading
+    networks:
+      - kyc_network
+
+  # Optional: Redis Commander (Web UI for Redis)
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: kyc_redis_commander
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    depends_on:
+      - redis
+    networks:
+      - kyc_network
+    profiles:
+      - debug
+
+networks:
+  kyc_network:
+    driver: bridge
+
+volumes:
+  redis_data:
+    driver: local
+  app_temp:
+    driver: local
+  app_data:
+    driver: local
