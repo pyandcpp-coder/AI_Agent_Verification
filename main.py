@@ -29,55 +29,27 @@ except ImportError:
     logging.basicConfig(level=logging.INFO)
     PRODUCTION_MODE = False
 
-# === CRITICAL FIX: Check GPU BEFORE setting environment ===
-USE_GPU = True
+# === GPU Detection ===
+USE_GPU = False
 GPU_AVAILABLE = False
 
-# Check if GPU exists before doing anything
+# Check if GPU exists
 try:
     import subprocess
     result = subprocess.run(['nvidia-smi'], capture_output=True, text=True, timeout=5)
     if result.returncode == 0:
         GPU_AVAILABLE = True
-        print("✅ NVIDIA GPU detected")
+        USE_GPU = True
+        print("✅ NVIDIA GPU detected and enabled")
 except:
     GPU_AVAILABLE = False
-    print("No NVIDIA GPU detected")
+    USE_GPU = False
+    print("⚠️ No NVIDIA GPU detected - using CPU mode")
 
-# Only force CPU if explicitly needed or if no GPU
+# Configure environment for CPU/GPU mode
 if not GPU_AVAILABLE:
     os.environ['CUDA_VISIBLE_DEVICES'] = ''
-    print("Using CPU mode (no GPU available)")
-else:
-    # Let GPU be visible
-    print("GPU mode enabled - initializing with GPU support")
-
-# Now import TensorFlow AFTER setting the environment
-try:
-    import tensorflow as tf
-    
-    if GPU_AVAILABLE:
-        # Configure GPU memory growth
-        gpus = tf.config.list_physical_devices('GPU')
-        if gpus:
-            try:
-                for gpu in gpus:
-                    tf.config.experimental.set_memory_growth(gpu, True)
-                USE_GPU = True
-                print(f"✅ TensorFlow GPU enabled: {len(gpus)} GPU(s) available")
-            except Exception as e:
-                print(f"⚠️ GPU memory growth setup failed: {e}")
-                USE_GPU = False
-        else:
-            print("⚠️ TensorFlow cannot see GPU, falling back to CPU")
-            USE_GPU = False
-    else:
-        print("ℹ️ TensorFlow using CPU mode")
-        USE_GPU = False
-        
-except Exception as e:
-    print(f"⚠️ TensorFlow import/setup failed: {e}")
-    USE_GPU = False
+    print("CPU mode configured")
 
 # Setup production logging if available
 if PRODUCTION_MODE:
