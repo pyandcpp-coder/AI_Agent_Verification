@@ -1,0 +1,4 @@
+/venv
+/.env
+Readme.md
+user_embeddings.pkl

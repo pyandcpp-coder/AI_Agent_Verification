@@ -1,0 +1,11 @@
+fastapi 
+uvicorn 
+pillow 
+numpy 
+pandas 
+scikit-learn 
+face_recognition 
+deepface 
+python-multipart 
+requests 
+jinja2

@@ -5,7 +5,8 @@ class VerificationScorer:
     def __init__(self):
         # Weights (Total 100) - Original Configuration
         self.weights = {
-            "face": 20,      # Face Similarity (reduced from 40)
+            "face": 15,      # Face Similarity (reduced from 40)
+            "face_recog": 5,  # Face Recognition ( to be implemented separately)
             "aadhar": 30,    # Valid Aadhaar Number (increased from 20)
             "dob": 30,       # Valid Age/DOB (increased from 20)
             "gender": 20     # Gender Match (unchanged)
