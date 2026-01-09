@@ -51,4 +51,4 @@ for PORT in "${PORTS[@]}"; do
 done
 
 echo ""
-echo "All ports checked. You can now run: docker compose up -d"
+echo "All ports checked. You can now run: uvicorn main:app --host 0.0.0.0 --port 8101"
